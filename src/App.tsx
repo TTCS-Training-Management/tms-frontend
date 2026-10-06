@@ -1,183 +1,2377 @@
-import { useEffect, useState } from 'react'
-import type { FormEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { ChangeEvent, FormEvent, InputHTMLAttributes } from 'react'
 import './App.css'
 
-type Role = 'admin' | 'lecturer' | 'accountant'
-type User = { id: number; full_name: string; email: string; role: Role; is_active: boolean; created_at: string }
-type Summary = { greeting: string; total_users: number; active_users: number; locked_users: number }
+type Role =
+  | 'guest'
+  | 'student'
+  | 'instructor'
+  | 'ta'
+  | 'training_manager'
+  | 'admissions'
+  | 'accountant'
+  | 'admin'
+type ModuleId =
+  | 'courses'
+  | 'leads'
+  | 'student_records'
+  | 'classes'
+  | 'attendance'
+  | 'materials'
+  | 'assignments'
+  | 'grades'
+  | 'billing'
+  | 'surveys'
+  | 'reports'
+type AppView = 'overview' | 'users' | `module:${ModuleId}`
+type User = {
+  id: number
+  full_name: string
+  email: string
+  phone: string | null
+  assigned_classes: string[]
+  handover_required: boolean
+  role: Role
+  roles: Role[]
+  permissions: Record<ModuleId | 'users', 'R' | 'W' | 'F' | '-'>
+  is_active: boolean
+  lock_reason: string | null
+  must_change_password: boolean
+  date_of_birth?: string | null
+  address?: string | null
+  avatar_url?: string | null
+  created_at: string
+}
 
-const API_URL = 'http://127.0.0.1:8000'
-const roleLabels: Record<Role, string> = { admin: 'Quản trị viên', lecturer: 'Giảng viên', accountant: 'Kế toán' }
+type UserPage = { items: User[]; total: number; page: number; page_size: number }
+type Summary = { greeting: string; total_users: number; active_users: number; locked_users: number }
+type UserFilters = { q: string; role: string; active: string; page: number }
+type UserInput = {
+  full_name: string
+  email: string
+  phone: string
+  roles: Role[]
+  assigned_classes: string[]
+}
+
+class ApiError extends Error {
+  readonly status: number
+  readonly retryAfterSeconds: number | null
+
+  constructor(message: string, status: number, retryAfterSeconds: number | null = null) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.retryAfterSeconds = retryAfterSeconds
+  }
+}
+
+type LoginLock = { email: string; until: number }
+
+function loginLockKey(email: string) {
+  return `tms:login-lock:${email.trim().toLowerCase()}`
+}
+
+function readLoginLock(email: string): LoginLock | null {
+  const normalizedEmail = email.trim().toLowerCase()
+  if (!normalizedEmail) return null
+  const until = Number(localStorage.getItem(loginLockKey(normalizedEmail)) ?? 0)
+  if (!Number.isFinite(until) || until <= Date.now()) {
+    localStorage.removeItem(loginLockKey(normalizedEmail))
+    return null
+  }
+  return { email: normalizedEmail, until }
+}
+
+function vietnameseApiError(detail: unknown, status: number): string {
+  if (typeof detail === 'string' && /[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]/i.test(detail)) {
+    return detail
+  }
+  if (status === 401) return 'Email hoặc mật khẩu không đúng, hoặc phiên đăng nhập đã hết hạn.'
+  if (status === 403) return 'Bạn không có quyền thực hiện thao tác này.'
+  if (status === 404) return 'Không tìm thấy dữ liệu được yêu cầu.'
+  if (status === 409) return 'Thông tin bị trùng lặp. Vui lòng kiểm tra lại.'
+  if (status === 422) return 'Thông tin chưa hợp lệ. Vui lòng kiểm tra lại các trường đã nhập.'
+  if (status === 423) return 'Tài khoản đang tạm khóa. Vui lòng thử lại sau.'
+  if (status >= 500) return 'Máy chủ đang gặp sự cố. Vui lòng thử lại sau.'
+  return 'Không thể hoàn thành yêu cầu. Vui lòng kiểm tra thông tin và thử lại.'
+}
+
+function readUserDraft(key: string): Partial<UserInput> | null {
+  const saved = sessionStorage.getItem(key)
+  if (!saved) return null
+  try {
+    return JSON.parse(saved) as Partial<UserInput>
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error
+    sessionStorage.removeItem(key)
+    return null
+  }
+}
+
+function readUserFilters(ownerId: number): UserFilters {
+  const key = `tms:users-filter:${ownerId}`
+  const saved = sessionStorage.getItem(key)
+  if (!saved) return { q: '', role: '', active: '', page: 1 }
+  try {
+    const parsed = JSON.parse(saved) as Partial<UserFilters>
+    return {
+      q: typeof parsed.q === 'string' ? parsed.q : '',
+      role: typeof parsed.role === 'string' ? parsed.role : '',
+      active: typeof parsed.active === 'string' ? parsed.active : '',
+      page: typeof parsed.page === 'number' && parsed.page >= 1 ? parsed.page : 1,
+    }
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error
+    sessionStorage.removeItem(key)
+    return { q: '', role: '', active: '', page: 1 }
+  }
+}
+
+function saveUserFilters(ownerId: number, filters: UserFilters) {
+  sessionStorage.setItem(`tms:users-filter:${ownerId}`, JSON.stringify(filters))
+}
+
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+const roleLabels: Record<Role, string> = {
+  guest: 'Khách truy cập',
+  student: 'Học viên',
+  instructor: 'Giảng viên',
+  ta: 'Trợ giảng',
+  training_manager: 'Quản lý đào tạo',
+  admissions: 'Tư vấn tuyển sinh',
+  accountant: 'Kế toán',
+  admin: 'Quản trị hệ thống',
+}
+const roleHomeMessages: Record<Role, string> = {
+  guest: 'Theo dõi thông tin và các bước đăng ký tư vấn.',
+  student: 'Theo dõi lớp học, bài tập, điểm số và học phí của bạn.',
+  instructor: 'Quản lý lớp giảng dạy, điểm danh, bài tập và tiến độ học viên.',
+  ta: 'Hỗ trợ điểm danh và học viên trong các lớp được phân công.',
+  training_manager: 'Theo dõi hoạt động đào tạo và vận hành các lớp học.',
+  admissions: 'Theo dõi đầu mối tuyển sinh và hồ sơ học viên.',
+  accountant: 'Theo dõi học phí, công nợ và báo cáo doanh thu.',
+  admin: 'Quản trị tài khoản, phân quyền và vận hành hệ thống.',
+}
+const moduleLabels: Record<ModuleId, string> = {
+  courses: 'Chương trình & môn học',
+  leads: 'Tuyển sinh & lead',
+  student_records: 'Hồ sơ học viên',
+  classes: 'Lớp học & thời khóa biểu',
+  attendance: 'Điểm danh',
+  materials: 'Học liệu & thông báo lớp',
+  assignments: 'Bài tập & chấm điểm',
+  grades: 'Điểm tổng kết & tốt nghiệp',
+  billing: 'Học phí & công nợ',
+  surveys: 'Khảo sát chất lượng',
+  reports: 'Báo cáo & dashboard',
+}
+const moduleOrder: ModuleId[] = [
+  'courses',
+  'leads',
+  'student_records',
+  'classes',
+  'attendance',
+  'materials',
+  'assignments',
+  'grades',
+  'billing',
+  'surveys',
+  'reports',
+]
+const moduleIcons: Record<ModuleId, string> = {
+  courses: '▤',
+  leads: '⌕',
+  student_records: '♙',
+  classes: '▦',
+  attendance: '✓',
+  materials: '▧',
+  assignments: '✎',
+  grades: '★',
+  billing: '₫',
+  surveys: '☷',
+  reports: '▥',
+}
+const roleOptions = Object.entries(roleLabels) as [Role, string][]
+const moduleFromView = (value: string): ModuleId | null =>
+  value.startsWith('module:') && moduleOrder.includes(value.slice(7) as ModuleId)
+    ? value.slice(7) as ModuleId
+    : null
+const viewKey = (value: string): value is AppView =>
+  value === 'overview' || value === 'users' || moduleFromView(value) !== null
+const permissionFor = (user: User, module: ModuleId): 'R' | 'W' | 'F' | null => {
+  const permission = user.permissions[module]
+  return permission !== '-' ? permission : null
+}
+const canManageUsers = (user: User) => user.permissions.users === 'F'
+const canViewUsers = (user: User) =>
+  user.permissions.users === 'R' || user.permissions.users === 'W' || user.permissions.users === 'F'
+const ACTIVITY_KEY = 'tms:last_activity'
+const ACTIVE_WINDOW_MS = 15 * 60 * 1000
+const REFRESH_INTERVAL_MS = 60 * 1000
+
+function PasswordInput(props: InputHTMLAttributes<HTMLInputElement>) {
+  const [visible, setVisible] = useState(false)
+  return (
+    <span className="password-field">
+      <input {...props} type={visible ? 'text' : 'password'} />
+      <button
+        type="button"
+        aria-label={visible ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+        aria-pressed={visible}
+        title={visible ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
+        onClick={() => setVisible((current) => !current)}
+      >
+        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          {visible ? (
+            <>
+              <path d="M3 3l18 18" />
+              <path d="M10.6 10.6a2 2 0 002.8 2.8" />
+              <path d="M9.9 5.2A10.8 10.8 0 0112 5c5 0 8.3 4.6 9 6-.3.6-1.2 2-2.8 3.5" />
+              <path d="M6.2 6.2C4.2 7.5 3.3 9.5 3 11c.7 1.4 4 6 9 6 1 0 1.9-.2 2.7-.5" />
+            </>
+          ) : (
+            <>
+              <path d="M2.5 12s3.3-6 9.5-6 9.5 6 9.5 6-3.3 6-9.5 6-9.5-6-9.5-6z" />
+              <circle cx="12" cy="12" r="2.5" />
+            </>
+          )}
+        </svg>
+      </button>
+    </span>
+  )
+}
+
+function clearSessionDrafts() {
+  for (const key of Object.keys(sessionStorage)) {
+    if (
+      key.startsWith('tms:user-draft:') ||
+      key.startsWith('tms:lock-reason:') ||
+      key.startsWith('tms:editing-user') ||
+      key.startsWith('tms:locking-user') ||
+      key.startsWith('tms:users-filter:')
+      || key.startsWith('tms:create-modal:')
+      || key === 'tms:current-view'
+      || key === 'tms:view-owner'
+    ) {
+      sessionStorage.removeItem(key)
+    }
+  }
+  sessionStorage.removeItem('tms:draft-owner')
+  localStorage.removeItem(ACTIVITY_KEY)
+}
 
 async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem('tms_token')
-  const response = await fetch(`${API_URL}${path}`, { ...options, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers } })
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Có lỗi xảy ra' }))
-    if (response.status === 401 || response.status === 403) {
-      const message = error.detail ?? 'Bạn không có quyền truy cập chức năng này'
-      window.dispatchEvent(new CustomEvent('tms:notice', { detail: message }))
-      if (response.status === 401) window.dispatchEvent(new CustomEvent('tms:session-expired', { detail: 'Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.' }))
-    }
-    throw new Error(error.detail ?? 'Có lỗi xảy ra')
+  const isFormData = options.body instanceof FormData
+  let response: Response
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers: {
+        ...(!isFormData ? { 'Content-Type': 'application/json' } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options.headers,
+      },
+    })
+  } catch {
+    throw new Error('Không thể kết nối đến máy chủ. Vui lòng kiểm tra kết nối hoặc thử lại sau.')
   }
-  return response.json() as Promise<T>
+  if (!response.ok) {
+    const error = (await response.json().catch(() => ({ detail: 'Có lỗi xảy ra' }))) as {
+      detail?: unknown
+    }
+    const message = vietnameseApiError(error.detail, response.status)
+    if (response.status === 401 && token && path !== '/auth/logout') {
+      window.dispatchEvent(
+        new CustomEvent('tms:session-expired', {
+          detail: message,
+        }),
+      )
+    } else if (response.status === 403) {
+      window.dispatchEvent(new CustomEvent('tms:access-denied', { detail: message }))
+    }
+    const retryAfterHeader = response.headers.get('Retry-After')
+    const retryAfterSeconds = retryAfterHeader && /^\d+$/.test(retryAfterHeader)
+      ? Number(retryAfterHeader)
+      : null
+    throw new ApiError(message, response.status, retryAfterSeconds)
+  }
+  if (response.status === 204) return undefined as T
+  return (await response.json()) as T
 }
 
 function App() {
   const [user, setUser] = useState<User | null>(null)
   const [loginError, setLoginError] = useState('')
-  const [loading, setLoading] = useState(true)
-  const [view, setView] = useState<'overview' | 'users'>('overview')
+  const [loginLock, setLoginLock] = useState<LoginLock | null>(() =>
+    readLoginLock(localStorage.getItem('tms_login_email') ?? ''),
+  )
+  const [loginSuccess, setLoginSuccess] = useState('')
+  const [loading, setLoading] = useState(() => Boolean(localStorage.getItem('tms_token')))
+  const [view, setView] = useState<AppView>(() => {
+    const saved = sessionStorage.getItem('tms:current-view') ?? 'overview'
+    return viewKey(saved) ? saved : 'overview'
+  })
   const [summary, setSummary] = useState<Summary | null>(null)
   const [users, setUsers] = useState<User[]>([])
-  const [createOpen, setCreateOpen] = useState(false)
+  const [userPage, setUserPage] = useState<UserPage | null>(null)
+  const [createOpenFor, setCreateOpenFor] = useState<number | null>(() => {
+    const owner = sessionStorage.getItem('tms:draft-owner')
+    return owner !== null && sessionStorage.getItem(`tms:create-modal:${owner}`) === 'open'
+      ? Number(owner)
+      : null
+  })
   const [passwordOpen, setPasswordOpen] = useState(false)
+  const [profileOpen, setProfileOpen] = useState(false)
   const [notice, setNotice] = useState('')
-  const [appError, setAppError] = useState<{ title: string; message: string; actionLabel: string } | null>(null)
+  const [noticeTone, setNoticeTone] = useState<'success' | 'error'>('error')
+  const [accessError, setAccessError] = useState('')
+  const lastActivityWrite = useRef(0)
+
+  function showNotice(message: string, tone: 'success' | 'error' = 'error') {
+    setNoticeTone(tone)
+    setNotice(message)
+  }
 
   useEffect(() => {
-    if (!localStorage.getItem('tms_token')) { setLoading(false); return }
-    apiRequest<User>('/auth/me').then(setUser).catch(() => localStorage.removeItem('tms_token')).finally(() => setLoading(false))
+    const localizeInvalidField = (event: Event) => {
+      const field = event.target
+      if (!(field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement)) return
+      const name = field.labels?.[0]?.textContent?.trim().replace(/\s+/g, ' ') || field.getAttribute('aria-label') || 'trường này'
+      const validity = field.validity
+      let message = 'Giá trị đã nhập chưa hợp lệ.'
+      if (validity.valueMissing) {
+        message = field instanceof HTMLSelectElement ? `Vui lòng chọn ${name}.` : `Vui lòng nhập ${name}.`
+      } else if (validity.typeMismatch && field.type === 'email') {
+        message = 'Vui lòng nhập địa chỉ email đúng định dạng.'
+      } else if (validity.tooShort) {
+        const minLength = field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement ? field.minLength : 0
+        message = `${name} cần có ít nhất ${minLength} ký tự.`
+      } else if (validity.tooLong) {
+        message = `${name} vượt quá độ dài cho phép.`
+      } else if (validity.rangeUnderflow) {
+        message = `${name} không được nhỏ hơn ${field instanceof HTMLInputElement ? field.min : ''}.`
+      } else if (validity.rangeOverflow) {
+        message = `${name} không được lớn hơn ${field instanceof HTMLInputElement ? field.max : ''}.`
+      } else if (validity.patternMismatch) {
+        message = `${name} chưa đúng định dạng yêu cầu.`
+      }
+      field.setCustomValidity(message)
+    }
+    const clearFieldMessage = (event: Event) => {
+      const field = event.target
+      if (field instanceof HTMLInputElement || field instanceof HTMLSelectElement || field instanceof HTMLTextAreaElement) {
+        field.setCustomValidity('')
+      }
+    }
+    document.addEventListener('invalid', localizeInvalidField, true)
+    document.addEventListener('input', clearFieldMessage, true)
+    document.addEventListener('change', clearFieldMessage, true)
+    return () => {
+      document.removeEventListener('invalid', localizeInvalidField, true)
+      document.removeEventListener('input', clearFieldMessage, true)
+      document.removeEventListener('change', clearFieldMessage, true)
+    }
   }, [])
 
   useEffect(() => {
-    if (!user) return
-    apiRequest<Summary>('/dashboard/summary').then(setSummary).catch(() => undefined)
-    if (user.role === 'admin') apiRequest<User[]>('/users').then(setUsers).catch(() => undefined)
-  }, [user])
-
-  useEffect(() => {
-    const showNotice = (event: Event) => setNotice((event as CustomEvent<string>).detail)
-    window.addEventListener('tms:notice', showNotice)
-    return () => window.removeEventListener('tms:notice', showNotice)
-  }, [])
-
-  useEffect(() => {
+    const showEventNotice = (event: Event) => showNotice((event as CustomEvent<string>).detail)
+    const showAccessError = (event: Event) => setAccessError((event as CustomEvent<string>).detail)
     const expireSession = (event: Event) => {
       const detail = (event as CustomEvent<string>).detail
       localStorage.removeItem('tms_token')
+      localStorage.removeItem(ACTIVITY_KEY)
       setUser(null)
       setSummary(null)
       setUsers([])
-      setAppError({ title: 'Phiên đăng nhập đã hết hạn', message: detail, actionLabel: 'Đăng nhập lại' })
+      setUserPage(null)
+      setPasswordOpen(false)
+      setProfileOpen(false)
+      setAccessError('')
       setLoginError(detail)
     }
+    window.addEventListener('tms:notice', showEventNotice)
+    window.addEventListener('tms:access-denied', showAccessError)
     window.addEventListener('tms:session-expired', expireSession)
-    return () => window.removeEventListener('tms:session-expired', expireSession)
+    return () => {
+      window.removeEventListener('tms:notice', showEventNotice)
+      window.removeEventListener('tms:access-denied', showAccessError)
+      window.removeEventListener('tms:session-expired', expireSession)
+    }
+  }, [])
+
+  useEffect(() => {
+    const token = localStorage.getItem('tms_token')
+    if (!token) return
+    apiRequest<User>('/auth/me')
+      .then(setUser)
+      .catch((error: unknown) => {
+        if (error instanceof ApiError && error.status === 401) {
+          localStorage.removeItem('tms_token')
+        }
+        setLoginError(error instanceof Error ? error.message : 'Không thể khôi phục phiên đăng nhập.')
+      })
+      .finally(() => setLoading(false))
   }, [])
 
   useEffect(() => {
     if (!user) return
+    const draftOwner = sessionStorage.getItem('tms:draft-owner')
+    if (draftOwner !== String(user.id)) {
+      clearSessionDrafts()
+      sessionStorage.setItem('tms:draft-owner', String(user.id))
+    }
+    if (canViewUsers(user)) {
+      apiRequest<Summary>('/dashboard/summary').then(setSummary).catch((error: Error) => showNotice(error.message))
+      loadUsers(readUserFilters(user.id), user.id).catch((error: Error) => showNotice(error.message))
+    }
+  }, [user])
+
+  function navigate(nextView: AppView) {
+    if (!user) return
+    sessionStorage.setItem('tms:current-view', nextView)
+    sessionStorage.setItem('tms:view-owner', String(user.id))
+    setView(nextView)
+  }
+
+  useEffect(() => {
+    if (!user) return
+    let expiryDispatched = false
+    const markActivity = () => {
+      const now = Date.now()
+      if (now - lastActivityWrite.current < 15_000) return
+      lastActivityWrite.current = now
+      localStorage.setItem(ACTIVITY_KEY, String(now))
+    }
+    if (!localStorage.getItem(ACTIVITY_KEY)) {
+      localStorage.setItem(ACTIVITY_KEY, String(Date.now()))
+    }
+    const activityEvents: (keyof WindowEventMap)[] = [
+      'pointerdown',
+      'pointermove',
+      'keydown',
+      'input',
+      'scroll',
+      'touchstart',
+      'focus',
+    ]
+    activityEvents.forEach((eventName) => window.addEventListener(eventName, markActivity, { passive: true }))
+    const markVisibleActivity = () => {
+      if (document.visibilityState === 'visible') markActivity()
+    }
+    document.addEventListener('visibilitychange', markVisibleActivity)
+    const idleTimer = window.setInterval(() => {
+      const lastActivity = Number(localStorage.getItem(ACTIVITY_KEY) ?? 0)
+      if (Date.now() - lastActivity <= ACTIVE_WINDOW_MS || expiryDispatched) return
+      expiryDispatched = true
+      window.dispatchEvent(new CustomEvent('tms:session-expired', {
+        detail: 'Phiên đăng nhập đã hết hạn do không hoạt động trong 15 phút. Bản nháp chưa lưu vẫn được giữ trong tab này.',
+      }))
+    }, 1000)
     const refreshTimer = window.setInterval(async () => {
+      const lastActivity = Number(localStorage.getItem(ACTIVITY_KEY) ?? 0)
+      const isActive = Date.now() - lastActivity <= ACTIVE_WINDOW_MS
+      if (!isActive || document.visibilityState !== 'visible') return
       try {
-        const result = await apiRequest<{ access_token: string }>('/auth/refresh', { method: 'POST' })
+        const result = await apiRequest<{ access_token: string; user: User }>('/auth/refresh', { method: 'POST' })
         localStorage.setItem('tms_token', result.access_token)
-      } catch {
-        // The session-expired event handles the redirect to login.
+        setUser((current) => {
+          if (
+            current &&
+            current.id === result.user.id &&
+            current.is_active === result.user.is_active &&
+            current.roles.length === result.user.roles.length &&
+            current.roles.every((role, index) => role === result.user.roles[index])
+          ) {
+            return current
+          }
+          return result.user
+        })
+      } catch (error) {
+        if (!(error instanceof ApiError && error.status === 401)) {
+          showNotice(error instanceof Error ? error.message : 'Không thể gia hạn phiên đăng nhập.')
+        }
       }
-    }, 5 * 60 * 1000)
-    return () => window.clearInterval(refreshTimer)
+    }, REFRESH_INTERVAL_MS)
+    return () => {
+      window.clearInterval(refreshTimer)
+      window.clearInterval(idleTimer)
+      activityEvents.forEach((eventName) => window.removeEventListener(eventName, markActivity))
+      document.removeEventListener('visibilitychange', markVisibleActivity)
+    }
   }, [user])
 
   async function login(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setLoginError('')
+    event.preventDefault()
+    setLoginError('')
+    setLoginSuccess('')
     const data = new FormData(event.currentTarget)
+    const email = String(data.get('email') ?? '').trim()
+    const password = String(data.get('password') ?? '')
+    if (!email || !password) {
+      setLoginError('Vui lòng nhập email và mật khẩu.')
+      return
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setLoginError('Vui lòng nhập địa chỉ email hợp lệ.')
+      return
+    }
     try {
-      const result = await apiRequest<{ access_token: string; user: User }>('/auth/login', { method: 'POST', body: JSON.stringify({ email: data.get('email'), password: data.get('password') }) })
-      localStorage.setItem('tms_token', result.access_token); localStorage.removeItem('tms_login_email'); setUser(result.user)
-    } catch (error) { setLoginError(error instanceof Error ? error.message : 'Không thể đăng nhập') }
+      const result = await apiRequest<{ access_token: string; user: User }>('/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      })
+      localStorage.setItem('tms_token', result.access_token)
+      localStorage.setItem(ACTIVITY_KEY, String(Date.now()))
+      localStorage.removeItem('tms_login_email')
+      localStorage.removeItem(loginLockKey(email))
+      setLoginLock(null)
+      setUser(result.user)
+      showNotice('Đăng nhập thành công.', 'success')
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 423) {
+        setLoginError('')
+        const retryAfterSeconds = error.retryAfterSeconds ?? 15 * 60
+        const lock = { email: email.toLowerCase(), until: Date.now() + retryAfterSeconds * 1000 }
+        localStorage.setItem(loginLockKey(lock.email), String(lock.until))
+        setLoginLock(lock)
+      } else {
+        setLoginError(error instanceof Error ? error.message : 'Không thể đăng nhập. Vui lòng thử lại.')
+      }
+    }
   }
 
-  async function logout() { await apiRequest('/auth/logout', { method: 'POST' }).catch(() => undefined); localStorage.removeItem('tms_token'); setUser(null); setSummary(null) }
-  async function toggleStatus(id: number) { const updated = await apiRequest<User>(`/users/${id}/status`, { method: 'PATCH' }); setUsers((current) => current.map((item) => item.id === id ? updated : item)) }
-  async function changeRole(id: number, role: Role) { const updated = await apiRequest<User>(`/users/${id}/role`, { method: 'PATCH', body: JSON.stringify({ role }) }); setUsers((current) => current.map((item) => item.id === id ? updated : item)) }
-  async function createUser(data: { full_name: string; email: string; password: string; role: Role }) { const created = await apiRequest<User>('/users', { method: 'POST', body: JSON.stringify(data) }); setUsers((current) => [created, ...current]); setCreateOpen(false) }
-  async function editUser(id: number, data: { full_name: string; email: string }) { const updated = await apiRequest<User>(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(data) }); setUsers((current) => current.map((item) => item.id === id ? updated : item)) }
-  async function changePassword(data: { current_password: string; new_password: string }) { await apiRequest('/auth/change-password', { method: 'POST', body: JSON.stringify(data) }); setPasswordOpen(false) }
+  async function loadUsers(filters: UserFilters, ownerId: number) {
+    saveUserFilters(ownerId, filters)
+    const params = new URLSearchParams({
+      page: String(filters.page),
+      page_size: '20',
+    })
+    if (filters.q.trim()) params.set('q', filters.q.trim())
+    if (filters.role) params.set('role', filters.role)
+    if (filters.active) params.set('active', filters.active)
+    const result = await apiRequest<UserPage>(`/users?${params.toString()}`)
+    setUsers(result.items)
+    setUserPage(result)
+  }
 
+  async function logout() {
+    try {
+      await apiRequest('/auth/logout', { method: 'POST' })
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        // An expired or already-revoked session is already invalid on the server.
+      } else if (error instanceof ApiError) {
+        showNotice(
+          `Máy chủ chưa xác nhận đăng xuất (mã ${error.status}). Phiên đăng nhập vẫn được giữ; ${error.message}`,
+        )
+        return
+      } else {
+        showNotice(
+          'Không thể kết nối máy chủ để thu hồi phiên. Phiên đăng nhập vẫn được giữ; hãy kiểm tra máy chủ rồi thử lại.',
+        )
+        return
+      }
+    }
+    localStorage.removeItem('tms_token')
+    setUser(null)
+    setSummary(null)
+    setUsers([])
+    setUserPage(null)
+    setView('overview')
+    setCreateOpenFor(null)
+    setProfileOpen(false)
+    setLoginSuccess('Đăng xuất thành công. Phiên đăng nhập đã được thu hồi.')
+    setAccessError('')
+    clearSessionDrafts()
+  }
+
+  async function createUser(data: UserInput) {
+    if (!user) throw new Error('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.')
+    const ownerId = user.id
+    let created: User
+    try {
+      created = await apiRequest<User>('/users', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không thể tạo tài khoản.'
+      showNotice(`Tạo tài khoản thất bại: ${message}`)
+      throw error
+    }
+    setCreateOpenFor(null)
+    sessionStorage.removeItem(`tms:create-modal:${ownerId}`)
+    const activationNotice =
+      `Đã tạo tài khoản ${created.email}. Máy chủ email đã chấp nhận thư kích hoạt; điều này chưa xác nhận thư đã tới hộp thư. Nếu chưa thấy thư, hãy kiểm tra Thư rác/Quảng cáo hoặc dùng chức năng Quên mật khẩu.`
+    showNotice(activationNotice, 'success')
+    try {
+      await loadUsers({ q: '', role: '', active: '', page: 1 }, ownerId)
+    } catch {
+      showNotice(`${activationNotice} Không thể làm mới danh sách ngay lúc này; hãy bấm Tìm kiếm để tải lại.`, 'success')
+    }
+  }
+
+  async function saveUser(id: number, data: UserInput) {
+    const original = users.find((item) => item.id === id)
+    if (!original) throw new Error('Không tìm thấy tài khoản đang chỉnh sửa. Hãy tải lại danh sách.')
+    const changedFields = [
+      original.full_name !== data.full_name && 'Họ và tên',
+      original.email !== data.email && 'Email',
+      (original.phone ?? '') !== data.phone && 'Số điện thoại',
+      original.assigned_classes.join(',') !== data.assigned_classes.join(',') && 'Lớp phụ trách',
+      JSON.stringify([...original.roles].sort()) !== JSON.stringify([...data.roles].sort()) && 'Vai trò',
+    ].filter((field): field is string => Boolean(field))
+    let updated: User | null = null
+    try {
+      updated = await apiRequest<User>(`/users/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      })
+      if (JSON.stringify([...original.roles].sort()) !== JSON.stringify([...data.roles].sort())) {
+        updated = await apiRequest<User>(`/users/${id}/role`, {
+          method: 'PATCH',
+          body: JSON.stringify({ roles: data.roles }),
+        })
+      }
+      const savedUser = updated
+      if (!savedUser) throw new Error('Máy chủ không trả về thông tin tài khoản đã cập nhật.')
+      setUsers((current) => current.map((item) => (item.id === id ? savedUser : item)))
+      setUser((current) => current?.id === id ? savedUser : current)
+      showNotice(
+        changedFields.length
+          ? `Đã cập nhật ${changedFields.join(', ')} cho tài khoản ${savedUser.email}.`
+          : 'Không có thông tin nào thay đổi.',
+        'success',
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không thể cập nhật tài khoản.'
+      const partiallyUpdated = updated
+      if (partiallyUpdated) {
+        setUsers((current) => current.map((item) => (item.id === id ? partiallyUpdated : item)))
+        setUser((current) => current?.id === id ? partiallyUpdated : current)
+        const savedFields = changedFields.filter((field) => field !== 'Vai trò')
+        showNotice(
+          `Đã cập nhật ${savedFields.length ? savedFields.join(', ') : 'thông tin tài khoản'}, nhưng cập nhật vai trò thất bại: ${message}`,
+        )
+      } else {
+        showNotice(`Cập nhật tài khoản thất bại: ${message}`)
+      }
+      throw error
+    }
+  }
+
+  async function deleteUser(userToDelete: User) {
+    try {
+      await apiRequest<void>(`/users/${userToDelete.id}`, { method: 'DELETE' })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không thể xóa tài khoản.'
+      showNotice(`Xóa tài khoản ${userToDelete.email} thất bại: ${message}`)
+      throw error
+    }
+    setUsers((current) => current.filter((item) => item.id !== userToDelete.id))
+    setUserPage((current) => current ? { ...current, total: Math.max(0, current.total - 1) } : current)
+    showNotice(`Đã xóa vĩnh viễn tài khoản ${userToDelete.email}.`, 'success')
+    if (user) {
+      try {
+        await loadUsers({ ...readUserFilters(user.id), page: 1 }, user.id)
+      } catch {
+        showNotice(`Đã xóa tài khoản ${userToDelete.email}, nhưng chưa tải lại được danh sách. Vui lòng bấm Tìm kiếm.`, 'success')
+      }
+    }
+  }
+
+  async function updateStatus(userToUpdate: User, active: boolean, reason: string) {
+    try {
+      const updated = await apiRequest<User>(`/users/${userToUpdate.id}/status`, {
+        method: 'PATCH',
+        body: JSON.stringify({ active, reason }),
+      })
+      setUsers((current) => current.map((item) => (item.id === userToUpdate.id ? updated : item)))
+      if (!active && updated.handover_required) {
+        showNotice(`Đã khóa tài khoản ${updated.email}. Cần bàn giao lớp: ${updated.assigned_classes.join(', ')}.`, 'success')
+      } else {
+        showNotice(`Đã ${active ? 'mở khóa' : 'khóa'} tài khoản ${updated.email}.`, 'success')
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không thể cập nhật trạng thái tài khoản.'
+      showNotice(`Thay đổi trạng thái tài khoản thất bại: ${message}`)
+      throw error
+    }
+  }
+
+  async function changePassword(data: { current_password: string; new_password: string }) {
+    let result: {
+      message: string
+      access_token: string
+      user: User
+    }
+    try {
+      result = await apiRequest<{
+        message: string
+        access_token: string
+        user: User
+      }>('/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Không thể đổi mật khẩu.'
+      showNotice(`Đổi mật khẩu thất bại: ${message}`)
+      throw error
+    }
+    localStorage.setItem('tms_token', result.access_token)
+    setUser(result.user)
+    setPasswordOpen(false)
+    showNotice(result.message, 'success')
+  }
+
+  async function updateProfile(data: { full_name: string; phone: string; date_of_birth: string; address: string }) {
+    const updated = await apiRequest<Partial<User>>('/profile', {
+      method: 'PATCH',
+      body: JSON.stringify({ ...data, date_of_birth: data.date_of_birth || null }),
+    })
+    setUser((current) => current ? { ...current, ...updated } : current)
+    showNotice('Đã cập nhật hồ sơ cá nhân.', 'success')
+  }
+
+  async function uploadAvatar(file: File) {
+    const formData = new FormData()
+    formData.append('file', file)
+    const result = await apiRequest<{ avatar_url: string }>('/profile/avatar', {
+      method: 'POST',
+      body: formData,
+    })
+    setUser((current) => current ? { ...current, avatar_url: result.avatar_url } : current)
+    showNotice('Đã cập nhật ảnh đại diện.', 'success')
+  }
+
+  async function importUsers(file: File) {
+    const formData = new FormData()
+    formData.append('file', file)
+    const result = await apiRequest<{ imported: number; skipped: number; errors: string[] }>('/users/import-excel', {
+      method: 'POST',
+      body: formData,
+    })
+    if (user) {
+      try {
+        await loadUsers({ ...readUserFilters(user.id), page: 1 }, user.id)
+      } catch (error) {
+        showNotice(`Nhập tài khoản đã hoàn tất, nhưng không thể tải lại danh sách: ${error instanceof Error ? error.message : 'lỗi không xác định'}`)
+      }
+    }
+    return result
+  }
+
+  async function previewUsersImport(file: File) {
+    const formData = new FormData()
+    formData.append('file', file)
+    return apiRequest<{ valid: number; skipped: number; errors: string[] }>('/users/import-excel/preview', {
+      method: 'POST',
+      body: formData,
+    })
+  }
+
+  if (window.location.pathname !== '/' && window.location.pathname !== '/index.html') {
+    if (window.location.pathname === '/register') return <PublicLeadPage />
+    return (
+      <ErrorScreen
+        title="Không tìm thấy trang"
+        message="Địa chỉ này không thuộc luồng làm việc hiện tại."
+        actionLabel="Quay lại trang chủ"
+        onAction={() => window.location.assign('/')}
+      />
+    )
+  }
   if (loading) return <div className="page-loader">Đang khởi động hệ thống...</div>
-  if (appError) return <ErrorScreen title={appError.title} message={appError.message} actionLabel={appError.actionLabel} onAction={() => { setAppError(null); setUser(null); setLoginError(''); setNotice(''); }} />
-  if (!user) return <LoginPage error={loginError} onSubmit={login} />
-  return <div className="app-shell">{notice && <div className="notice" role="alert">{notice}<button onClick={() => setNotice('')} aria-label="Đóng thông báo">×</button></div>}<aside className="sidebar"><div className="brand"><div className="brand-mark">T</div><div><strong>TMS</strong><span>Training Management</span></div></div><div className="workspace-label">KHÔNG GIAN LÀM VIỆC</div><nav className="main-nav"><button className={view === 'overview' ? 'nav-item active' : 'nav-item'} onClick={() => setView('overview')}><span>⌂</span>Tổng quan</button>{user.role === 'admin' && <button className={view === 'users' ? 'nav-item active' : 'nav-item'} onClick={() => setView('users')}><span>♙</span>Tài khoản</button>}</nav><div className="sidebar-bottom"><button className="profile-mini" onClick={logout}><Avatar name={user.full_name} /><span><strong>{user.full_name}</strong><small>{roleLabels[user.role]}</small></span><span className="logout-icon">↪</span></button></div></aside><main className="main-content"><header className="topbar"><div className="breadcrumb">Hệ thống / <strong>{view === 'overview' ? 'Tổng quan' : 'Tài khoản'}</strong></div><div className="topbar-actions"><span className="status-dot" />Hệ thống đang hoạt động<button className="icon-button" onClick={() => setPasswordOpen(true)} aria-label="Đổi mật khẩu">⌘</button></div></header><div className="content-wrap">{view === 'overview' ? <Overview user={user} summary={summary} onUsers={() => setView('users')} /> : <UsersView users={users} onCreate={() => setCreateOpen(true)} onToggle={toggleStatus} onRoleChange={changeRole} onEdit={editUser} />}</div></main>{createOpen && <CreateUserModal onClose={() => setCreateOpen(false)} onCreate={createUser} />}{passwordOpen && <ChangePasswordModal onClose={() => setPasswordOpen(false)} onChange={changePassword} />}</div>
+  if (!user) return (
+    <LoginPage
+      error={loginError}
+      success={loginSuccess}
+      lock={loginLock}
+      onEmailChange={(email) => {
+        setLoginError('')
+        setLoginLock(readLoginLock(email))
+      }}
+      onSubmit={login}
+    />
+  )
+  const showPasswordModal = passwordOpen || user.must_change_password
+  const savedViewBelongsToUser =
+    sessionStorage.getItem('tms:view-owner') === String(user.id)
+  const selectedModule = moduleFromView(view)
+  const selectedModulePermission = selectedModule ? permissionFor(user, selectedModule) : null
+  const currentView: AppView = !savedViewBelongsToUser
+    ? 'overview'
+    : view === 'users' && canViewUsers(user)
+      ? 'users'
+      : selectedModule && selectedModulePermission
+        ? view
+        : 'overview'
+  if (accessError) {
+    return (
+      <ErrorScreen
+        title="Không đủ quyền truy cập"
+        message={accessError}
+        actionLabel="Quay lại tổng quan"
+        onAction={() => { setAccessError(''); navigate('overview') }}
+      />
+    )
+  }
+
+  return (
+    <div className="app-shell">
+      {notice && (
+        <div className={`notice ${noticeTone}`} role={noticeTone === 'error' ? 'alert' : 'status'}>
+          {notice}
+          <button onClick={() => setNotice('')} aria-label="Đóng thông báo">×</button>
+        </div>
+      )}
+      {profileOpen && (
+        <ProfileModal
+          user={user}
+          onClose={() => setProfileOpen(false)}
+          onUpdate={updateProfile}
+          onUploadAvatar={uploadAvatar}
+          onChangePassword={() => {
+            setProfileOpen(false)
+            setPasswordOpen(true)
+          }}
+          onLogout={() => void logout()}
+        />
+      )}
+      <aside className="sidebar">
+        <div className="brand">
+          <img className="institution-logo" src="/ictu-logo.png" alt="Biểu trưng ICTU" />
+          <div className="brand-name"><span>Hệ Thống</span><span>Quản Lý Đào Tạo</span></div>
+        </div>
+        <div className="workspace-label">KHÔNG GIAN LÀM VIỆC</div>
+        <nav className="main-nav">
+          <button className={currentView === 'overview' ? 'nav-item active' : 'nav-item'} onClick={() => navigate('overview')}>
+            <span>⌂</span>Tổng quan
+          </button>
+          {moduleOrder.filter((module) => permissionFor(user, module) !== null).map((module) => (
+            <button
+              key={module}
+              className={currentView === `module:${module}` ? 'nav-item active' : 'nav-item'}
+              onClick={() => {
+                navigate(`module:${module}`)
+              }}
+              title={`${moduleLabels[module]} · Quyền ${permissionFor(user, module)}`}
+            >
+              <span aria-hidden="true">{moduleIcons[module]}</span>{moduleLabels[module]}
+            </button>
+          ))}
+          {canViewUsers(user) && (
+            <button className={currentView === 'users' ? 'nav-item active' : 'nav-item'} onClick={() => navigate('users')}>
+              <span>♙</span>Tài khoản
+            </button>
+          )}
+        </nav>
+        <div className="sidebar-bottom">
+          <div className="profile-actions">
+            <button className="profile-mini" onClick={() => setProfileOpen(true)} aria-label="Mở thông tin cá nhân" title="Thông tin cá nhân">
+              <Avatar name={user.full_name} avatarUrl={user.avatar_url} />
+              <span className="profile-label"><strong>{user.full_name}</strong><small>{user.roles.map((role) => roleLabels[role]).join(', ')}</small></span>
+              <span className="profile-chevron" aria-hidden="true">›</span>
+            </button>
+          </div>
+        </div>
+      </aside>
+      <main className="main-content">
+        <header className="topbar">
+          <div className="breadcrumb">Hệ thống / <strong>{selectedModule && currentView === view ? moduleLabels[selectedModule] : currentView === 'overview' ? 'Tổng quan' : 'Tài khoản'}</strong></div>
+          <div className="topbar-actions">
+            <span className="status-dot" />Hệ thống đang hoạt động
+          </div>
+        </header>
+        <div className="content-wrap">
+          {currentView === 'overview' ? (
+            <Overview user={user} summary={summary} onUsers={() => navigate('users')} canViewUsers={canViewUsers(user)} onModule={(module) => navigate(`module:${module}`)} />
+          ) : currentView === 'users' && userPage ? (
+            <UsersView
+              users={users}
+              page={userPage}
+              ownerId={user.id}
+              canManage={canManageUsers(user)}
+              onQuery={(filters) => loadUsers(filters, user.id)}
+              onCreate={() => {
+                sessionStorage.setItem(`tms:create-modal:${user.id}`, 'open')
+                setCreateOpenFor(user.id)
+              }}
+              onEdit={saveUser}
+              onDelete={deleteUser}
+              onStatus={updateStatus}
+              onImport={importUsers}
+              onPreviewImport={previewUsersImport}
+            />
+          ) : selectedModule && selectedModulePermission ? (
+            <ModuleLanding module={selectedModule} permission={selectedModulePermission} />
+          ) : (
+            <div className="page-loader">Đang tải danh sách tài khoản...</div>
+          )}
+        </div>
+      </main>
+      {createOpenFor === user.id &&
+        sessionStorage.getItem('tms:draft-owner') === String(user.id) &&
+        sessionStorage.getItem(`tms:create-modal:${user.id}`) === 'open' && (
+        <UserModal ownerId={user.id} title="Tạo tài khoản" onClose={() => { sessionStorage.removeItem(`tms:create-modal:${user.id}`); setCreateOpenFor(null) }} onSave={createUser} />
+      )}
+      {showPasswordModal && (
+        <ChangePasswordModal
+          required={user.must_change_password}
+          onClose={() => setPasswordOpen(false)}
+          onChange={changePassword}
+        />
+      )}
+    </div>
+  )
 }
 
 function ErrorScreen({ title, message, actionLabel, onAction }: { title: string; message: string; actionLabel: string; onAction: () => void }) {
-  return <main className="error-screen"><div className="error-card"><div className="brand-mark large">T</div><p className="eyebrow blue">THÔNG BÁO</p><h2>{title}</h2><p>{message}</p><button className="primary-button full" onClick={onAction}>{actionLabel}</button></div></main>
+  return (
+    <main className="error-screen">
+      <section className="error-card">
+        <div className="brand-mark large">T</div>
+        <p className="eyebrow blue">THÔNG BÁO</p>
+        <h2>{title}</h2>
+        <p>{message}</p>
+        <button className="primary-button full" onClick={onAction}>{actionLabel}</button>
+      </section>
+    </main>
+  )
 }
 
-function LoginPage({ error, onSubmit }: { error: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void }) {
-  const [forgot, setForgot] = useState(false)
+function LoginPage({
+  error,
+  success,
+  lock,
+  onEmailChange,
+  onSubmit,
+}: {
+  error: string
+  success: string
+  lock: LoginLock | null
+  onEmailChange: (email: string) => void
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void
+}) {
+  const initialResetToken = new URLSearchParams(window.location.search).get('reset_token') ?? ''
+  const [forgot, setForgot] = useState(Boolean(initialResetToken))
   const [forgotMessage, setForgotMessage] = useState('')
-  const [resetRequested, setResetRequested] = useState(false)
-  const [resetToken, setResetToken] = useState('')
+  const [forgotError, setForgotError] = useState('')
+  const [resetToken, setResetToken] = useState(initialResetToken)
   const [newPassword, setNewPassword] = useState('')
+  const [email, setEmail] = useState(localStorage.getItem('tms_login_email') ?? '')
+  const [now, setNow] = useState(() => Date.now())
+  const normalizedEmail = email.trim().toLowerCase()
+  const lockRemaining = lock?.email === normalizedEmail
+    ? Math.max(0, Math.ceil((lock.until - now) / 1000))
+    : 0
+  const lockCountdown = `${String(Math.floor(lockRemaining / 60)).padStart(2, '0')}:${String(lockRemaining % 60).padStart(2, '0')}`
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   async function requestReset(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const email = String(new FormData(event.currentTarget).get('email'));
+    event.preventDefault()
+    setForgotMessage('')
+    setForgotError('')
+    const email = String(new FormData(event.currentTarget).get('email'))
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setForgotError('Vui lòng nhập địa chỉ email hợp lệ.')
+      return
+    }
     try {
       const result = await apiRequest<{ message: string }>('/auth/forgot-password', {
         method: 'POST',
         body: JSON.stringify({ email }),
       })
-      setResetRequested(true)
       setForgotMessage(result.message)
     } catch (requestError) {
-      setResetRequested(false)
-      setForgotMessage(requestError instanceof Error ? requestError.message : 'Không thể khôi phục mật khẩu')
+      setForgotError(requestError instanceof Error ? requestError.message : 'Không thể khôi phục mật khẩu')
     }
   }
 
   async function submitReset(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+    event.preventDefault()
+    setForgotMessage('')
+    setForgotError('')
+    if (newPassword.length < 8 || !/[A-Za-z]/.test(newPassword) || !/\d/.test(newPassword)) {
+      setForgotError('Mật khẩu phải có ít nhất 8 ký tự, gồm chữ cái và chữ số.')
+      return
+    }
     try {
       const result = await apiRequest<{ message: string }>('/auth/reset-password', {
         method: 'POST',
         body: JSON.stringify({ token: resetToken, new_password: newPassword }),
       })
       setForgotMessage(result.message)
-      setResetRequested(false)
       setResetToken('')
       setNewPassword('')
+      window.history.replaceState({}, '', window.location.pathname)
       setForgot(false)
     } catch (requestError) {
-      setForgotMessage(requestError instanceof Error ? requestError.message : 'Không thể đặt lại mật khẩu')
+      setForgotError(requestError instanceof Error ? requestError.message : 'Không thể đặt lại mật khẩu')
     }
   }
 
-  return <main className="login-page"><section className="login-visual"><div className="visual-overlay" /></section><section className="login-panel"><div className="login-form-wrap login-card"><div className="school-brand"><div className="brand-mark">T</div><h1>HỆ THỐNG ĐÀO TẠO TRỰC TUYẾN</h1></div>{forgot ? <><p className="eyebrow blue">KHÔI PHỤC TRUY CẬP</p><h2>Quên mật khẩu</h2><p className="form-intro">Nhập email để nhận mã khôi phục và đặt lại mật khẩu mới.</p><form onSubmit={requestReset} className="login-form"><label>Email công việc<input name="email" type="email" defaultValue={localStorage.getItem('tms_login_email') ?? ''} onChange={(event) => localStorage.setItem('tms_login_email', event.target.value)} required /></label><button className="primary-button full" type="submit">Tạo mã khôi phục</button></form>{forgotMessage && <div className={forgotMessage.toLowerCase().includes('thành công') ? 'form-success' : 'form-error'}>{forgotMessage}</div>}{resetRequested && <form onSubmit={submitReset} className="login-form"><label>Mã khôi phục<input value={resetToken} onChange={(event) => setResetToken(event.target.value)} required /></label><label>Mật khẩu mới<input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} minLength={8} placeholder="Ít nhất 8 ký tự, gồm chữ hoa, chữ thường, số và ký tự đặc biệt" required /></label><button className="primary-button full" type="submit">Đặt lại mật khẩu</button></form>}<button className="link-button back-link" onClick={() => { setForgot(false); setForgotMessage(''); setResetRequested(false); setResetToken(''); setNewPassword('') }}>← Quay lại đăng nhập</button></> : <><p className="eyebrow blue">CHÀO MỪNG QUAY TRỞ LẠI</p><h2>Đăng nhập</h2><p className="form-intro">Đăng nhập để tiếp tục với không gian làm việc của bạn.</p><form onSubmit={onSubmit} className="login-form"><label>Email công việc<input name="email" type="email" defaultValue={localStorage.getItem('tms_login_email') ?? ''} onChange={(event) => localStorage.setItem('tms_login_email', event.target.value)} required /></label><label>Mật khẩu<input name="password" type="password" required /></label>{error && <div className="form-error">{error}</div>}<button className="primary-button full" type="submit">Đăng nhập <span>→</span></button></form><button className="link-button back-link" onClick={() => setForgot(true)}>Quên mật khẩu?</button></>}</div></section></main>
+  return (
+    <main className="login-page">
+      <section className="login-visual"><div className="visual-overlay" /></section>
+      <section className="login-panel">
+        <div className="login-form-wrap login-card">
+          <div className="school-brand"><img className="institution-logo" src="/ictu-logo.png" alt="Biểu trưng ICTU" /><h1><span>Hệ Thống</span><span>Quản Lý Đào Tạo</span></h1></div>
+          {forgot ? (
+            <>
+              <p className="eyebrow blue">KHÔI PHỤC TRUY CẬP</p>
+              <h2>Quên mật khẩu</h2>
+              {resetToken ? (
+                <>
+                  <p className="form-intro">Đặt mật khẩu mới cho tài khoản của bạn.</p>
+                  <form onSubmit={submitReset} className="login-form" noValidate>
+                    <label>Mật khẩu mới<PasswordInput value={newPassword} onChange={(event) => setNewPassword(event.target.value)} minLength={8} autoComplete="new-password" required /></label>
+                    <button className="primary-button full" type="submit">Đặt lại mật khẩu</button>
+                  </form>
+                </>
+              ) : (
+                <>
+                  <p className="form-intro">Nhập email để nhận liên kết đặt lại mật khẩu có hiệu lực trong 30 phút.</p>
+                  <form onSubmit={requestReset} className="login-form" noValidate>
+                    <label>Email công việc<input name="email" type="email" defaultValue={localStorage.getItem('tms_login_email') ?? ''} onChange={(event) => localStorage.setItem('tms_login_email', event.target.value)} required /></label>
+                    <button className="primary-button full" type="submit">Gửi liên kết đặt lại</button>
+                  </form>
+                </>
+              )}
+              {forgotMessage && <div className="form-success" role="status">{forgotMessage}</div>}
+              {forgotError && <div className="form-error" role="alert">{forgotError}</div>}
+              <button className="link-button back-link" onClick={() => { setForgot(false); setForgotMessage(''); setForgotError(''); setResetToken('') }}>← Quay lại đăng nhập</button>
+            </>
+          ) : (
+            <>
+              <p className="eyebrow blue">CHÀO MỪNG QUAY TRỞ LẠI</p>
+              <h2>Đăng nhập</h2>
+              <p className="form-intro">Đăng nhập để tiếp tục với không gian làm việc của bạn.</p>
+              {success && <div className="form-success" role="status">{success}</div>}
+              {forgotMessage && <div className="form-success" role="status">{forgotMessage}</div>}
+              <form onSubmit={onSubmit} className="login-form" noValidate>
+                <label>Email công việc<input name="email" type="email" value={email} onChange={(event) => { setEmail(event.target.value); localStorage.setItem('tms_login_email', event.target.value); onEmailChange(event.target.value) }} required /></label>
+                <label>Mật khẩu<PasswordInput name="password" autoComplete="current-password" required /></label>
+                {error && lockRemaining <= 0 && <div className="form-error" role="alert">{error}</div>}
+                {lockRemaining > 0 && <div className="form-error" role="status">Tài khoản này đang bị khóa đăng nhập. Có thể thử lại sau {lockCountdown}.</div>}
+                <button className="primary-button full login-submit" type="submit" disabled={lockRemaining > 0}>
+                  {lockRemaining > 0 ? `Đang khóa · ${lockCountdown}` : 'Đăng nhập'}
+                  {lockRemaining <= 0 && <span>→</span>}
+                </button>
+              </form>
+              <button className="link-button back-link" onClick={() => setForgot(true)}>Quên mật khẩu?</button>
+              <a className="link-button back-link" href="/register">Đăng ký tư vấn</a>
+            </>
+          )}
+        </div>
+      </section>
+    </main>
+  )
 }
 
-function Overview({ user, summary, onUsers }: { user: User; summary: Summary | null; onUsers: () => void }) {
-  return <div className="view"><div className="page-heading"><div><p className="eyebrow blue">TỔNG QUAN HỆ THỐNG</p><h1>Chào buổi sáng, {user.full_name.split(' ').at(-1)}</h1><p className="muted">Theo dõi nhanh trạng thái tài khoản và quyền truy cập.</p></div><button className="primary-button" onClick={onUsers}>Quản lý tài khoản <span>→</span></button></div><div className="stat-grid"><StatCard label="Tổng tài khoản" value={summary?.total_users ?? '—'} detail="Trong hệ thống" icon="◎" tone="blue" /><StatCard label="Đang hoạt động" value={summary?.active_users ?? '—'} detail="Tài khoản khả dụng" icon="✓" tone="green" /><StatCard label="Đang bị khóa" value={summary?.locked_users ?? '—'} detail="Cần kiểm tra" icon="⊘" tone="orange" /></div></div>
-}
-function StatCard({ label, value, detail, icon, tone }: { label: string; value: string | number; detail: string; icon: string; tone: string }) { return <article className="stat-card"><div className={`stat-icon ${tone}`}>{icon}</div><div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div><span className="stat-arrow">↗</span></article> }
-function Avatar({ name }: { name: string }) { return <span className="avatar">{name.split(' ').map((part) => part[0]).slice(-2).join('').toUpperCase()}</span> }
-
-function UsersView({ users, onCreate, onToggle, onRoleChange, onEdit }: { users: User[]; onCreate: () => void; onToggle: (id: number) => Promise<void>; onRoleChange: (id: number, role: Role) => Promise<void>; onEdit: (id: number, data: { full_name: string; email: string }) => Promise<void> }) {
-  const [query, setQuery] = useState('')
-  const [editing, setEditing] = useState<User | null>(null)
-  const filteredUsers = users.filter((item) => `${item.full_name} ${item.email}`.toLowerCase().includes(query.toLowerCase()))
-  return <div className="view"><div className="page-heading"><div><p className="eyebrow blue">QUẢN TRỊ HỆ THỐNG</p><h1>Tài khoản</h1><p className="muted">Quản lý thành viên và quyền truy cập vào hệ thống.</p></div><button className="primary-button" onClick={onCreate}>＋ Tạo tài khoản</button></div><section className="table-card"><div className="table-toolbar"><div className="search-box">⌕<input placeholder="Tìm theo tên hoặc email" value={query} onChange={(event) => setQuery(event.target.value)} /></div><span className="table-count">{filteredUsers.length} tài khoản</span></div><div className="table-scroll"><table><thead><tr><th>Người dùng</th><th>Vai trò</th><th>Trạng thái</th><th>Ngày tạo</th><th /></tr></thead><tbody>{filteredUsers.map((item) => <tr key={item.id}><td><div className="user-cell"><Avatar name={item.full_name} /><span><strong>{item.full_name}</strong><small>{item.email}</small></span></div></td><td><select className="role-select" value={item.role} onChange={(event) => onRoleChange(item.id, event.target.value as Role)}><option value="admin">Quản trị viên</option><option value="lecturer">Giảng viên</option><option value="accountant">Kế toán</option></select></td><td><span className={item.is_active ? 'status-pill active' : 'status-pill locked'}><i />{item.is_active ? 'Hoạt động' : 'Đã khóa'}</span></td><td className="date-cell">{new Date(item.created_at).toLocaleDateString('vi-VN')}</td><td><button className="row-action" onClick={() => setEditing(item)}>Sửa</button><button className={item.is_active ? 'row-action danger' : 'row-action'} onClick={() => onToggle(item.id)}>{item.is_active ? 'Khóa' : 'Mở khóa'}</button></td></tr>)}</tbody></table></div></section>{editing && <EditUserModal user={editing} onClose={() => setEditing(null)} onEdit={async (data) => { await onEdit(editing.id, data); setEditing(null) }} />}</div>
-}
-
-function ChangePasswordModal({ onClose, onChange }: { onClose: () => void; onChange: (data: { current_password: string; new_password: string }) => Promise<void> }) {
+function PublicLeadPage() {
+  const [form, setForm] = useState({ full_name: '', phone: '', email: '', program_interest: '', notes: '' })
+  const [message, setMessage] = useState('')
   const [error, setError] = useState('')
-  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); try { await onChange({ current_password: String(data.get('current_password')), new_password: String(data.get('new_password')) }) } catch (submitError) { setError(submitError instanceof Error ? submitError.message : 'Không thể đổi mật khẩu') } }
-  return <div className="modal-backdrop"><section className="modal"><div className="modal-header"><div><p className="eyebrow blue">BẢO MẬT TÀI KHOẢN</p><h2>Đổi mật khẩu</h2></div><button className="close-button" onClick={onClose}>×</button></div><form onSubmit={submit} className="create-form"><label>Mật khẩu hiện tại<input name="current_password" type="password" required /></label><label>Mật khẩu mới<input name="new_password" type="password" minLength={8} placeholder="Ít nhất 8 ký tự, gồm chữ hoa, chữ thường, số và ký tự đặc biệt" required /></label>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose}>Hủy</button><button className="primary-button" type="submit">Cập nhật</button></div></form></section></div>
+  const [submitting, setSubmitting] = useState(false)
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSubmitting(true)
+    setError('')
+    setMessage('')
+    try {
+      const data = new FormData(event.currentTarget)
+      const result = await apiRequest<{ message: string }>('/leads/public', {
+        method: 'POST',
+        body: JSON.stringify({ ...form, source: 'website', website: String(data.get('website') ?? '') }),
+      })
+      setMessage(result.message)
+      setForm({ full_name: '', phone: '', email: '', program_interest: '', notes: '' })
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Không thể gửi đăng ký tư vấn.')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <main className="error-screen">
+      <section className="modal public-lead-card">
+        <p className="eyebrow blue">TƯ VẤN TUYỂN SINH</p>
+        <h1>Đăng ký nhận tư vấn</h1>
+        <p className="muted">Để lại thông tin, bộ phận tuyển sinh sẽ sớm liên hệ với bạn.</p>
+        {message && <div className="form-success" role="status">{message}</div>}
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <form className="stack" onSubmit={(event) => void submit(event)}>
+          <label>Họ và tên<input value={form.full_name} onChange={(event) => setForm({ ...form, full_name: event.target.value })} required /></label>
+          <label>Số điện thoại<input type="tel" value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} required /></label>
+          <label>Email<input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} /></label>
+          <label>Chương trình quan tâm<input value={form.program_interest} onChange={(event) => setForm({ ...form, program_interest: event.target.value })} /></label>
+          <label>Ghi chú<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>
+          <label className="lead-honeypot" aria-hidden="true">Website<input name="website" tabIndex={-1} autoComplete="off" /></label>
+          <button className="primary-button" type="submit" disabled={submitting}>{submitting ? 'Đang gửi...' : 'Gửi đăng ký'}</button>
+        </form>
+        <a className="link-button back-link" href="/">Quay lại đăng nhập</a>
+      </section>
+    </main>
+  )
 }
 
-function EditUserModal({ user, onClose, onEdit }: { user: User; onClose: () => void; onEdit: (data: { full_name: string; email: string }) => Promise<void> }) {
-  const [error, setError] = useState('')
-  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); try { await onEdit({ full_name: String(data.get('full_name')), email: String(data.get('email')) }) } catch (submitError) { setError(submitError instanceof Error ? submitError.message : 'Không thể cập nhật tài khoản') } }
-  return <div className="modal-backdrop"><section className="modal"><div className="modal-header"><div><p className="eyebrow blue">THÔNG TIN TÀI KHOẢN</p><h2>Chỉnh sửa</h2></div><button className="close-button" onClick={onClose}>×</button></div><form onSubmit={submit} className="create-form"><label>Họ và tên<input name="full_name" defaultValue={user.full_name} required /></label><label>Email<input name="email" type="email" defaultValue={user.email} required /></label>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose}>Hủy</button><button className="primary-button" type="submit">Lưu thay đổi</button></div></form></section></div>
+function Overview({
+  user,
+  summary,
+  onUsers,
+  canViewUsers: showUsers,
+  onModule,
+}: {
+  user: User
+  summary: Summary | null
+  onUsers: () => void
+  canViewUsers: boolean
+  onModule: (module: ModuleId) => void
+}) {
+  const accessibleModules = moduleOrder.filter((module) => permissionFor(user, module) !== null)
+  return (
+    <div className="view">
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow blue">KHÔNG GIAN {user.roles.length > 1 ? 'LÀM VIỆC' : roleLabels[user.roles[0] ?? user.role].toLocaleUpperCase('vi-VN')}</p>
+          <h1>Xin chào, {user.full_name.split(' ').at(-1)}</h1>
+          <p className="muted">{roleHomeMessages[user.roles[0] ?? user.role]} Vai trò: {user.roles.map((role) => roleLabels[role]).join(', ')}</p>
+        </div>
+        {showUsers && <button className="primary-button" onClick={onUsers}>Quản lý tài khoản <span>→</span></button>}
+      </div>
+      {summary && showUsers ? (
+        <div className="stat-grid">
+          <StatCard label="Tổng tài khoản" value={summary.total_users} detail="Trong hệ thống" icon="◎" tone="blue" />
+          <StatCard label="Đang hoạt động" value={summary.active_users} detail="Tài khoản khả dụng" icon="✓" tone="green" />
+          <StatCard label="Đang bị khóa" value={summary.locked_users} detail="Cần kiểm tra" icon="⊘" tone="orange" />
+        </div>
+      ) : (
+        <section className="welcome-card role-welcome">
+          <p className="eyebrow light">KHÔNG GIAN LÀM VIỆC</p>
+          <h2>{roleLabels[user.roles[0] ?? user.role]}</h2>
+          <p>{roleHomeMessages[user.roles[0] ?? user.role]}</p>
+        </section>
+      )}
+      <section className="role-workspace">
+        <div className="section-title"><div><h2>Chức năng theo quyền</h2><p className="muted">Các mục dưới đây được lọc theo vai trò của bạn.</p></div><span className="count-badge">{accessibleModules.length} mục</span></div>
+        {accessibleModules.length > 0 ? (
+          <div className="module-grid">
+            {accessibleModules.map((module) => (
+              <button className="module-card" key={module} onClick={() => onModule(module)}>
+                <span className="module-icon">{moduleIcons[module]}</span>
+                <span><strong>{moduleLabels[module]}</strong><small>Quyền: {permissionLabel(permissionFor(user, module))}</small></span>
+                <span className="module-arrow">→</span>
+              </button>
+            ))}
+          </div>
+        ) : (
+          <p className="muted">Tài khoản chưa được cấp quyền truy cập module nghiệp vụ nào.</p>
+        )}
+      </section>
+    </div>
+  )
 }
 
-function CreateUserModal({ onClose, onCreate }: { onClose: () => void; onCreate: (data: { full_name: string; email: string; password: string; role: Role }) => Promise<void> }) {
+function permissionLabel(permission: 'R' | 'W' | 'F' | null) {
+  if (permission === 'F') return 'Toàn quyền'
+  if (permission === 'W') return 'Được ghi'
+  if (permission === 'R') return 'Chỉ xem'
+  return 'Không truy cập'
+}
+
+function ModuleLanding({ module, permission }: { module: ModuleId; permission: 'R' | 'W' | 'F' }) {
+  type Program = {
+    id: number
+    code: string
+    name: string
+    description: string | null
+    total_duration_hours: number
+    standard_fee: number
+    status: string
+  }
+
+  type Subject = {
+    id: number
+    code: string
+    name: string
+    session_count: number
+    weight: number
+    description: string | null
+    learning_outcomes: string | null
+  }
+
+  type ProgramSubject = {
+    id: number
+    subject_id: number
+    code: string
+    name: string
+    sequence_order: number
+    prerequisite_subject_id: number | null
+    prerequisite_name: string | null
+    is_required: boolean
+  }
+
+  type SubjectSession = { id: number; sequence: number; title: string; objectives: string | null }
+  type TrainingClassRecord = { id: number; name: string; status: 'planned' | 'running' | 'completed' | 'cancelled' }
+
+  type LeadRecord = {
+    id: number
+    full_name: string
+    phone: string
+    email: string | null
+    source: string
+    status: string
+    program_interest: string | null
+    notes: string | null
+    assigned_to_user_id: number | null
+    assigned_to_name: string | null
+    created_at: string
+  }
+  type LeadAssignee = { id: number; full_name: string }
+
+  const [programs, setPrograms] = useState<Program[]>([])
+  const [selectedProgramId, setSelectedProgramId] = useState<number | null>(null)
+  const [subjects, setSubjects] = useState<Subject[]>([])
+  const [selectedSubjectId, setSelectedSubjectId] = useState<number | null>(null)
+  const [subjectSessions, setSubjectSessions] = useState<SubjectSession[]>([])
+  const [programSubjects, setProgramSubjects] = useState<ProgramSubject[]>([])
+  const [trainingClasses, setTrainingClasses] = useState<TrainingClassRecord[]>([])
+  const [className, setClassName] = useState('')
+  const [draggedAssociationId, setDraggedAssociationId] = useState<number | null>(null)
+  const [leads, setLeads] = useState<LeadRecord[]>([])
+  const [leadAssignees, setLeadAssignees] = useState<LeadAssignee[]>([])
+  const [leadFilters, setLeadFilters] = useState({ q: '', status: '', source: '' })
+  const [leadError, setLeadError] = useState('')
+  const [programForm, setProgramForm] = useState({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' })
+  const [subjectForm, setSubjectForm] = useState({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' })
+  const [editingProgramId, setEditingProgramId] = useState<number | null>(null)
+  const [editingSubjectId, setEditingSubjectId] = useState<number | null>(null)
+  const [programLinkForm, setProgramLinkForm] = useState({ subject_id: '', sequence_order: '1', prerequisite_subject_id: '', is_required: 'true' })
+  const [leadForm, setLeadForm] = useState({ full_name: '', phone: '', email: '', source: 'website', program_interest: '', notes: '' })
+  const [sessionForm, setSessionForm] = useState({ sequence: '1', title: '', objectives: '' })
+  const [cloneSourceSubjectId, setCloneSourceSubjectId] = useState('')
+  const [statusMessage, setStatusMessage] = useState('')
+
+  async function loadPrograms() {
+    const next = await apiRequest<Program[]>('/training/programs', { method: 'GET' })
+    setPrograms(next)
+    if (!selectedProgramId && next[0]) setSelectedProgramId(next[0].id)
+    if (selectedProgramId) {
+      const selected = next.find((item) => item.id === selectedProgramId)
+      if (!selected && next[0]) setSelectedProgramId(next[0].id)
+    }
+  }
+
+  async function loadSubjects() {
+    const next = await apiRequest<Subject[]>('/training/subjects', { method: 'GET' })
+    setSubjects(next)
+  }
+
+  async function loadProgramSubjects(programId: number) {
+    const next = await apiRequest<ProgramSubject[]>(`/training/programs/${programId}/subjects`, { method: 'GET' })
+    setProgramSubjects(next)
+  }
+
+  async function loadTrainingClasses(programId: number) {
+    const next = await apiRequest<TrainingClassRecord[]>(`/training/programs/${programId}/classes`, { method: 'GET' })
+    setTrainingClasses(next)
+  }
+
+  async function loadSubjectSessions(subjectId: number) {
+    const next = await apiRequest<SubjectSession[]>(`/training/subjects/${subjectId}/sessions`, { method: 'GET' })
+    setSubjectSessions(next)
+  }
+
+  async function loadLeads(filters = leadFilters) {
+    const params = new URLSearchParams()
+    if (filters.q.trim()) params.set('q', filters.q.trim())
+    if (filters.status) params.set('status', filters.status)
+    if (filters.source) params.set('source', filters.source)
+    const next = await apiRequest<LeadRecord[]>(`/leads${params.size ? `?${params.toString()}` : ''}`, { method: 'GET' })
+    setLeads(next)
+  }
+
+  useEffect(() => {
+    if (module === 'courses') {
+      void loadPrograms().catch((error: Error) => setStatusMessage(error.message))
+      void loadSubjects().catch((error: Error) => setStatusMessage(error.message))
+    }
+    if (module === 'leads') {
+      void loadLeads().catch((error: Error) => setLeadError(error.message))
+      if (permission === 'F') {
+        apiRequest<LeadAssignee[]>('/leads/assignees', { method: 'GET' })
+          .then(setLeadAssignees)
+          .catch((error: Error) => setLeadError(error.message))
+      }
+    }
+  }, [module, permission])
+
+  useEffect(() => {
+    if (module === 'courses' && selectedProgramId) {
+      void loadProgramSubjects(selectedProgramId).catch((error: Error) => setStatusMessage(error.message))
+      void loadTrainingClasses(selectedProgramId).catch((error: Error) => setStatusMessage(error.message))
+    }
+  }, [module, selectedProgramId])
+
+  useEffect(() => {
+    if (module === 'courses' && selectedSubjectId) {
+      void loadSubjectSessions(selectedSubjectId).catch((error: Error) => setStatusMessage(error.message))
+    }
+  }, [module, selectedSubjectId])
+
+  async function saveProgram(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const payload = {
+      code: programForm.code,
+      name: programForm.name,
+      description: programForm.description,
+      total_duration_hours: Number(programForm.total_duration_hours || 0),
+      standard_fee: Number(programForm.standard_fee || 0),
+      status: programForm.status,
+    }
+    try {
+      await apiRequest(editingProgramId ? `/training/programs/${editingProgramId}` : '/training/programs', {
+        method: editingProgramId ? 'PATCH' : 'POST',
+        body: JSON.stringify(payload),
+      })
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu chương trình.')
+      return
+    }
+    setProgramForm({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' })
+    setStatusMessage(editingProgramId ? 'Đã cập nhật chương trình đào tạo.' : 'Đã lưu chương trình đào tạo.')
+    setEditingProgramId(null)
+    void loadPrograms()
+  }
+
+  function editProgram(program: Program) {
+    setEditingProgramId(program.id)
+    setProgramForm({
+      code: program.code,
+      name: program.name,
+      description: program.description ?? '',
+      total_duration_hours: String(program.total_duration_hours),
+      standard_fee: String(program.standard_fee),
+      status: program.status,
+    })
+  }
+
+  async function deleteProgram(program: Program) {
+    if (!window.confirm(`Xóa chương trình ${program.name}? Các liên kết môn học và hồ sơ lớp không còn diễn ra sẽ bị xóa. Chương trình đang có lớp diễn ra không thể xóa.`)) return
+    try {
+      await apiRequest(`/training/programs/${program.id}`, { method: 'DELETE' })
+      setStatusMessage('Đã xóa chương trình đào tạo.')
+      if (editingProgramId === program.id) {
+        setEditingProgramId(null)
+        setProgramForm({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' })
+      }
+      await loadPrograms()
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể xóa chương trình.')
+    }
+  }
+
+  async function saveSubject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const payload = {
+      code: subjectForm.code,
+      name: subjectForm.name,
+      session_count: Number(subjectForm.session_count || 0),
+      weight: Number(subjectForm.weight || 1),
+      description: subjectForm.description,
+      learning_outcomes: subjectForm.learning_outcomes,
+    }
+    try {
+      await apiRequest(editingSubjectId ? `/training/subjects/${editingSubjectId}` : '/training/subjects', {
+        method: editingSubjectId ? 'PATCH' : 'POST',
+        body: JSON.stringify(payload),
+      })
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu môn học.')
+      return
+    }
+    setSubjectForm({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' })
+    setStatusMessage(editingSubjectId ? 'Đã cập nhật môn học.' : 'Đã lưu môn học.')
+    setEditingSubjectId(null)
+    void loadSubjects()
+  }
+
+  function editSubject(subject: Subject) {
+    setEditingSubjectId(subject.id)
+    setSubjectForm({
+      code: subject.code,
+      name: subject.name,
+      session_count: String(subject.session_count),
+      weight: String(subject.weight),
+      description: subject.description ?? '',
+      learning_outcomes: subject.learning_outcomes ?? '',
+    })
+  }
+
+  async function deleteSubject(subject: Subject) {
+    if (!window.confirm(`Xóa môn học ${subject.name}? Môn sẽ được gỡ khỏi tất cả chương trình và không thể xóa khi đang được dùng trong lớp diễn ra.`)) return
+    try {
+      await apiRequest(`/training/subjects/${subject.id}`, { method: 'DELETE' })
+      setStatusMessage('Đã xóa môn học.')
+      if (editingSubjectId === subject.id) {
+        setEditingSubjectId(null)
+        setSubjectForm({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' })
+      }
+      if (selectedSubjectId === subject.id) {
+        setSelectedSubjectId(null)
+        setSubjectSessions([])
+      }
+      await loadSubjects()
+      if (selectedProgramId) await loadProgramSubjects(selectedProgramId)
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể xóa môn học.')
+    }
+  }
+
+  async function saveProgramSubject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedProgramId) return
+    const payload = {
+      subject_id: Number(programLinkForm.subject_id),
+      sequence_order: Number(programLinkForm.sequence_order || 1),
+      prerequisite_subject_id: programLinkForm.prerequisite_subject_id ? Number(programLinkForm.prerequisite_subject_id) : null,
+      is_required: programLinkForm.is_required === 'true',
+    }
+    try {
+      await apiRequest(`/training/programs/${selectedProgramId}/subjects`, { method: 'POST', body: JSON.stringify(payload) })
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể gán môn học vào chương trình.')
+      return
+    }
+    setProgramLinkForm({ subject_id: '', sequence_order: '1', prerequisite_subject_id: '', is_required: 'true' })
+    setStatusMessage('Đã gán môn học vào chương trình.')
+    void loadProgramSubjects(selectedProgramId)
+  }
+
+  async function removeProgramSubject(item: ProgramSubject) {
+    if (!selectedProgramId) return
+    try {
+      await apiRequest(`/training/programs/${selectedProgramId}/subjects/${item.id}`, { method: 'DELETE' })
+      await loadProgramSubjects(selectedProgramId)
+      setStatusMessage(`Đã gỡ ${item.name} khỏi chương trình.`)
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể gỡ môn học.')
+    }
+  }
+
+  async function persistProgramSubjectOrder(orderedItems: ProgramSubject[]) {
+    if (!selectedProgramId) return
+    try {
+      await apiRequest(`/training/programs/${selectedProgramId}/subjects/order`, {
+        method: 'PUT',
+        body: JSON.stringify({ association_ids: orderedItems.map((item) => item.id) }),
+      })
+      await loadProgramSubjects(selectedProgramId)
+      setStatusMessage('Đã lưu thứ tự môn học.')
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu thứ tự môn học.')
+    }
+  }
+
+  async function createTrainingClass(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedProgramId) return
+    try {
+      await apiRequest(`/training/programs/${selectedProgramId}/classes`, {
+        method: 'POST',
+        body: JSON.stringify({ name: className }),
+      })
+      setClassName('')
+      await loadTrainingClasses(selectedProgramId)
+      setStatusMessage('Đã tạo lớp ở trạng thái chuẩn bị.')
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể tạo lớp.')
+    }
+  }
+
+  async function updateTrainingClass(classId: number, status: TrainingClassRecord['status']) {
+    try {
+      await apiRequest(`/training/classes/${classId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ status }),
+      })
+      if (selectedProgramId) await loadTrainingClasses(selectedProgramId)
+      setStatusMessage('Đã cập nhật trạng thái lớp.')
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể cập nhật trạng thái lớp.')
+    }
+  }
+
+  async function saveSubjectSession(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedSubjectId) return
+    try {
+      await apiRequest(`/training/subjects/${selectedSubjectId}/sessions`, {
+        method: 'POST',
+        body: JSON.stringify({
+          sequence: Number(sessionForm.sequence),
+          title: sessionForm.title,
+          objectives: sessionForm.objectives,
+        }),
+      })
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu buổi học.')
+      return
+    }
+    setSessionForm({ sequence: String(subjectSessions.length + 2), title: '', objectives: '' })
+    setStatusMessage('Đã lưu buổi học.')
+    void loadSubjectSessions(selectedSubjectId)
+  }
+
+  async function cloneSubjectSessions(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedSubjectId || !cloneSourceSubjectId) return
+    try {
+      const result = await apiRequest<{ copied_count: number }>(`/training/subjects/${selectedSubjectId}/sessions/clone`, {
+        method: 'POST',
+        body: JSON.stringify({ source_subject_id: Number(cloneSourceSubjectId) }),
+      })
+      await loadSubjectSessions(selectedSubjectId)
+      setCloneSourceSubjectId('')
+      setStatusMessage(`Đã sao chép ${result.copied_count} buổi học vào môn đích.`)
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : 'Không thể sao chép buổi học.')
+    }
+  }
+
+  async function submitLead(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const payload = {
+      full_name: leadForm.full_name,
+      phone: leadForm.phone,
+      email: leadForm.email,
+      source: leadForm.source,
+      program_interest: leadForm.program_interest,
+      notes: leadForm.notes,
+      website: '',
+    }
+    try {
+      await apiRequest('/leads', { method: 'POST', body: JSON.stringify(payload) })
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể gửi đăng ký tư vấn.')
+      return
+    }
+    setLeadForm({ full_name: '', phone: '', email: '', source: 'website', program_interest: '', notes: '' })
+    setStatusMessage('Đã tạo lead và ghi nhận thông tin tư vấn.')
+    void loadLeads().catch((error: Error) => setLeadError(error.message))
+  }
+
+  async function updateLead(leadId: number, status: string) {
+    try {
+      await apiRequest(`/leads/${leadId}`, { method: 'PATCH', body: JSON.stringify({ status }) })
+      await loadLeads()
+      setLeadError('')
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể cập nhật trạng thái lead.')
+    }
+  }
+
+  async function assignLead(leadId: number, assignedTo: string) {
+    try {
+      await apiRequest(`/leads/${leadId}/assign`, {
+        method: 'POST',
+        body: JSON.stringify({ assigned_to_user_id: assignedTo || null }),
+      })
+      await loadLeads()
+      setLeadError('')
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể phân công lead.')
+    }
+  }
+
+  if (module === 'courses') {
+    return (
+      <section className="module-landing stack courses-landing">
+        <div className="module-icon">{moduleIcons[module]}</div>
+        <p className="eyebrow blue">CHƯƠNG TRÌNH ĐÀO TẠO</p>
+        <h1>{moduleLabels[module]}</h1>
+        <p>Bạn được cấp quyền <strong>{permissionLabel(permission)}</strong> cho chức năng này.</p>
+        {statusMessage && <div className="form-success" role="status">{statusMessage}</div>}
+        {permission === 'F' && <div className="two-column-grid">
+          <form className="card-panel" onSubmit={saveProgram}>
+            <h3>{editingProgramId ? 'Cập nhật chương trình' : 'Thêm chương trình'}</h3>
+            <label>Mã chương trình<input value={programForm.code} onChange={(event) => setProgramForm({ ...programForm, code: event.target.value })} required /></label>
+            <label>Tên chương trình<input value={programForm.name} onChange={(event) => setProgramForm({ ...programForm, name: event.target.value })} required /></label>
+            <label>Mô tả<textarea value={programForm.description} onChange={(event) => setProgramForm({ ...programForm, description: event.target.value })} /></label>
+            <div className="inline-row">
+              <label>Thời lượng<input type="number" min="0" value={programForm.total_duration_hours} onChange={(event) => setProgramForm({ ...programForm, total_duration_hours: event.target.value })} /></label>
+              <label>Học phí chuẩn<input type="number" min="0" value={programForm.standard_fee} onChange={(event) => setProgramForm({ ...programForm, standard_fee: event.target.value })} /></label>
+            </div>
+            <label>Trạng thái<select value={programForm.status} onChange={(event) => setProgramForm({ ...programForm, status: event.target.value })}><option value="active">Đang áp dụng</option><option value="inactive">Tạm ngưng</option></select></label>
+            <div className="inline-row">
+              <button className="primary-button" type="submit">{editingProgramId ? 'Lưu thay đổi' : 'Lưu chương trình'}</button>
+              {editingProgramId && <button className="secondary-button" type="button" onClick={() => { setEditingProgramId(null); setProgramForm({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' }) }}>Hủy sửa</button>}
+            </div>
+          </form>
+
+          <form className="card-panel" onSubmit={saveSubject}>
+            <h3>{editingSubjectId ? 'Cập nhật môn học' : 'Thêm môn học'}</h3>
+            <label>Mã môn học<input value={subjectForm.code} onChange={(event) => setSubjectForm({ ...subjectForm, code: event.target.value })} required /></label>
+            <label>Tên môn học<input value={subjectForm.name} onChange={(event) => setSubjectForm({ ...subjectForm, name: event.target.value })} required /></label>
+            <div className="inline-row">
+              <label>Số buổi<input type="number" min="0" value={subjectForm.session_count} onChange={(event) => setSubjectForm({ ...subjectForm, session_count: event.target.value })} /></label>
+              <label>Trọng số<input type="number" min="1" value={subjectForm.weight} onChange={(event) => setSubjectForm({ ...subjectForm, weight: event.target.value })} /></label>
+            </div>
+            <label>Mô tả<textarea value={subjectForm.description} onChange={(event) => setSubjectForm({ ...subjectForm, description: event.target.value })} /></label>
+            <label>Kết quả đầu ra<textarea value={subjectForm.learning_outcomes} onChange={(event) => setSubjectForm({ ...subjectForm, learning_outcomes: event.target.value })} /></label>
+            <div className="inline-row">
+              <button className="primary-button" type="submit">{editingSubjectId ? 'Lưu thay đổi' : 'Lưu môn học'}</button>
+              {editingSubjectId && <button className="secondary-button" type="button" onClick={() => { setEditingSubjectId(null); setSubjectForm({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' }) }}>Hủy sửa</button>}
+            </div>
+          </form>
+        </div>}
+
+        <div className="two-column-grid">
+          <div className="card-panel">
+            <h3>Danh sách chương trình</h3>
+            {programs.length === 0 ? <p className="muted">Chưa có chương trình nào.</p> : (
+              <div className="list-stack">
+                {programs.map((program) => (
+                  <div className="management-list-row" key={program.id}>
+                    <button className={selectedProgramId === program.id ? 'list-item active' : 'list-item'} type="button" onClick={() => setSelectedProgramId(program.id)}>
+                      <strong>{program.code} · {program.name}</strong>
+                      <small>{program.status === 'active' ? 'Đang áp dụng' : 'Tạm ngưng'} · {program.total_duration_hours} giờ · {program.standard_fee.toLocaleString('vi-VN')} VNĐ</small>
+                    </button>
+                    {permission === 'F' && <div className="row-actions"><button className="row-action" type="button" onClick={() => editProgram(program)}>Sửa</button><button className="row-action danger" type="button" onClick={() => void deleteProgram(program)}>Xóa</button></div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="card-panel">
+            <h3>Liên kết môn học với chương trình</h3>
+            {selectedProgramId && permission === 'F' ? (
+              <form onSubmit={saveProgramSubject}>
+                <label>Chọn môn học<select value={programLinkForm.subject_id} onChange={(event) => setProgramLinkForm({ ...programLinkForm, subject_id: event.target.value })}>
+                  <option value="">-- Chọn môn học --</option>
+                  {subjects.filter((subject) => !programSubjects.some((link) => link.subject_id === subject.id)).map((subject) => <option key={subject.id} value={String(subject.id)}>{subject.code} · {subject.name}</option>)}
+                </select></label>
+                <div className="inline-row"><label>Thứ tự<input type="number" min="1" value={programLinkForm.sequence_order} onChange={(event) => setProgramLinkForm({ ...programLinkForm, sequence_order: event.target.value })} /></label><label>Tiên quyết<select value={programLinkForm.prerequisite_subject_id} onChange={(event) => setProgramLinkForm({ ...programLinkForm, prerequisite_subject_id: event.target.value })}><option value="">Không có</option>{programSubjects.filter((item) => String(item.subject_id) !== programLinkForm.subject_id).map((item) => <option key={item.id} value={String(item.subject_id)}>{item.name}</option>)}</select></label></div>
+                <label>Bắt buộc<select value={programLinkForm.is_required} onChange={(event) => setProgramLinkForm({ ...programLinkForm, is_required: event.target.value })}><option value="true">Có</option><option value="false">Không</option></select></label>
+                <button className="primary-button" type="submit">Gán môn học</button>
+              </form>
+            ) : <p className="muted">{selectedProgramId ? 'Bạn chỉ có quyền xem chương trình này.' : 'Chọn một chương trình để gán môn học.'}</p>}
+            <div className="space-top">
+              {programSubjects.length > 0 ? [...programSubjects].sort((a, b) => a.sequence_order - b.sequence_order).map((item) => (
+                <div
+                  key={item.id}
+                  className="curriculum-row"
+                  draggable={permission === 'F'}
+                  onDragStart={(event) => { setDraggedAssociationId(item.id); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', String(item.id)) }}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => {
+                    event.preventDefault()
+                    const draggedId = draggedAssociationId ?? Number(event.dataTransfer.getData('text/plain'))
+                    setDraggedAssociationId(null)
+                    if (!draggedId || draggedId === item.id) return
+                    const ordered = [...programSubjects].sort((a, b) => a.sequence_order - b.sequence_order)
+                    const from = ordered.findIndex((entry) => entry.id === draggedId)
+                    const to = ordered.findIndex((entry) => entry.id === item.id)
+                    if (from < 0 || to < 0) return
+                    const [moved] = ordered.splice(from, 1)
+                    ordered.splice(to, 0, moved)
+                    void persistProgramSubjectOrder(ordered)
+                  }}
+                  onDragEnd={() => setDraggedAssociationId(null)}
+                >
+                  <span className="curriculum-grip" aria-hidden="true">⠿</span>
+                  <div className="curriculum-description">
+                    <strong>{item.sequence_order}. {item.name}</strong>
+                    <small>{item.is_required ? 'Bắt buộc' : 'Tự chọn'}{item.prerequisite_name ? ` · Tiên quyết: ${item.prerequisite_name}` : ''}</small>
+                  </div>
+                  {permission === 'F' && <button className="row-action danger" type="button" onClick={() => void removeProgramSubject(item)}>Gỡ</button>}
+                </div>
+              )) : <p className="muted">Chưa có môn nào được gắn cho chương trình này.</p>}
+            </div>
+          </div>
+        </div>
+        <div className="card-panel">
+          <h3>Lớp thuộc chương trình</h3>
+          {selectedProgramId ? (
+            <>
+              {permission === 'F' && <form className="inline-row class-create-form" onSubmit={(event) => void createTrainingClass(event)}>
+                <label>Tên lớp<input value={className} onChange={(event) => setClassName(event.target.value)} maxLength={200} required /></label>
+                <button className="primary-button" type="submit" disabled={programs.find((item) => item.id === selectedProgramId)?.status !== 'active'}>Tạo lớp</button>
+              </form>}
+              {trainingClasses.length > 0 ? <div className="list-stack space-top">
+                {trainingClasses.map((trainingClass) => <div className="class-row" key={trainingClass.id}>
+                  <strong>{trainingClass.name}</strong>
+                  {permission === 'F' ? <select aria-label={`Trạng thái lớp ${trainingClass.name}`} value={trainingClass.status} onChange={(event) => void updateTrainingClass(trainingClass.id, event.target.value as TrainingClassRecord['status'])}>
+                    <option value="planned">Chuẩn bị</option><option value="running">Đang diễn ra</option><option value="completed">Đã kết thúc</option><option value="cancelled">Đã hủy</option>
+                  </select> :                   <small>{trainingClass.status === 'planned' ? 'Chuẩn bị' : trainingClass.status === 'running' ? 'Đang diễn ra' : trainingClass.status === 'completed' ? 'Đã kết thúc' : 'Đã hủy'}</small>}
+                </div>)}
+              </div> : <p className="muted">Chưa có lớp nào được mở từ chương trình này.</p>}
+            </>
+          ) : <p className="muted">Chọn chương trình để quản lý các lớp.</p>}
+        </div>
+        <div className="two-column-grid">
+          <div className="card-panel">
+            <h3>Danh sách môn học</h3>
+            {subjects.length === 0 ? <p className="muted">Chưa có môn học nào.</p> : (
+              <div className="list-stack">
+                {subjects.map((subject) => (
+                  <div className="management-list-row" key={subject.id}>
+                    <button className={selectedSubjectId === subject.id ? 'list-item active' : 'list-item'} type="button" onClick={() => setSelectedSubjectId(subject.id)}>
+                      <strong>{subject.code} · {subject.name}</strong>
+                      <small>{subject.session_count} buổi · Trọng số {subject.weight}</small>
+                    </button>
+                    {permission === 'F' && <div className="row-actions"><button className="row-action" type="button" onClick={() => editSubject(subject)}>Sửa</button><button className="row-action danger" type="button" onClick={() => void deleteSubject(subject)}>Xóa</button></div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="card-panel">
+            <h3>Buổi học theo môn</h3>
+            {!selectedSubjectId ? <p className="muted">Chọn một môn học để xem hoặc thêm buổi học.</p> : (
+              <>
+                {permission === 'F' && <form onSubmit={(event) => void saveSubjectSession(event)}>
+                  <div className="inline-row">
+                    <label>Thứ tự buổi<input type="number" min="1" value={sessionForm.sequence} onChange={(event) => setSessionForm({ ...sessionForm, sequence: event.target.value })} required /></label>
+                    <label>Tên buổi<input value={sessionForm.title} onChange={(event) => setSessionForm({ ...sessionForm, title: event.target.value })} required /></label>
+                  </div>
+                  <label>Mục tiêu<textarea value={sessionForm.objectives} onChange={(event) => setSessionForm({ ...sessionForm, objectives: event.target.value })} /></label>
+                  <button className="primary-button" type="submit">Thêm buổi học</button>
+                </form>}
+                {permission === 'F' && <form className="inline-row session-clone-form" onSubmit={(event) => void cloneSubjectSessions(event)}>
+                  <label>Sao chép buổi từ môn<select value={cloneSourceSubjectId} onChange={(event) => setCloneSourceSubjectId(event.target.value)} required>
+                    <option value="">-- Chọn môn nguồn --</option>
+                    {subjects.filter((subject) => subject.id !== selectedSubjectId).map((subject) => <option key={subject.id} value={String(subject.id)}>{subject.code} · {subject.name}</option>)}
+                  </select></label>
+                  <button className="secondary-button" type="submit">Sao chép buổi</button>
+                </form>}
+                <div className="space-top">
+                  {subjectSessions.length > 0 ? subjectSessions.map((session) => <div className="list-row" key={session.id}><span>{session.sequence}. {session.title}</span><small>{session.objectives}</small></div>) : <p className="muted">Chưa có buổi học nào.</p>}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </section>
+    )
+  }
+
+  if (module === 'leads') {
+    return (
+      <section className="module-landing stack lead-landing">
+        <div className="module-icon">{moduleIcons[module]}</div>
+        <p className="eyebrow blue">ĐẦU PHỄU TUYỂN SINH</p>
+        <h1>{moduleLabels[module]}</h1>
+        <p>Bạn được cấp quyền <strong>{permissionLabel(permission)}</strong> cho chức năng này.</p>
+        {leadError && <div className="form-error" role="alert">{leadError}</div>}
+        {statusMessage && <div className="form-success" role="status">{statusMessage}</div>}
+        {permission === 'F' && <p><a href="/register" target="_blank" rel="noreferrer">Mở form đăng ký tư vấn công khai ↗</a></p>}
+        <div className="two-column-grid lead-workspace-grid">
+          {permission === 'F' && <form className="card-panel lead-create-form" onSubmit={submitLead}>
+            <h3>Đăng ký tư vấn</h3>
+            <label>Họ tên<input value={leadForm.full_name} onChange={(event) => setLeadForm({ ...leadForm, full_name: event.target.value })} /></label>
+            <label>Số điện thoại<input value={leadForm.phone} onChange={(event) => setLeadForm({ ...leadForm, phone: event.target.value })} /></label>
+            <label>Email<input type="email" value={leadForm.email} onChange={(event) => setLeadForm({ ...leadForm, email: event.target.value })} /></label>
+            <label>Chương trình quan tâm<input value={leadForm.program_interest} onChange={(event) => setLeadForm({ ...leadForm, program_interest: event.target.value })} /></label>
+            <label>Nguồn<select value={leadForm.source} onChange={(event) => setLeadForm({ ...leadForm, source: event.target.value })}><option value="website">Website</option><option value="facebook">Facebook</option><option value="walkin">Tự đến</option><option value="referral">Giới thiệu</option></select></label>
+            <label>Ghi chú<textarea value={leadForm.notes} onChange={(event) => setLeadForm({ ...leadForm, notes: event.target.value })} /></label>
+            <button className="primary-button" type="submit">Gửi thông tin</button>
+          </form>}
+
+          <div className="card-panel lead-list-panel">
+            <h3>Danh sách lead</h3>
+            <form className="lead-filters" onSubmit={(event) => { event.preventDefault(); void loadLeads().catch((error: Error) => setLeadError(error.message)) }}>
+              <label>Tìm kiếm<input placeholder="Tên, điện thoại hoặc email" value={leadFilters.q} onChange={(event) => setLeadFilters({ ...leadFilters, q: event.target.value })} /></label>
+              <div className="inline-row">
+                <label>Trạng thái<select value={leadFilters.status} onChange={(event) => setLeadFilters({ ...leadFilters, status: event.target.value })}><option value="">Tất cả</option><option value="new">Mới</option><option value="assigned">Đã phân công</option><option value="contacted">Đã liên hệ</option><option value="qualified">Tiềm năng</option><option value="converted">Đã đăng ký</option><option value="lost">Không tiếp tục</option></select></label>
+                <label>Nguồn<select value={leadFilters.source} onChange={(event) => setLeadFilters({ ...leadFilters, source: event.target.value })}><option value="">Tất cả</option><option value="website">Website</option><option value="facebook">Facebook</option><option value="walkin">Tự đến</option><option value="referral">Giới thiệu</option></select></label>
+              </div>
+              <button className="secondary-button" type="submit">Lọc danh sách</button>
+            </form>
+            {leads.length === 0 ? <p className="muted">Chưa có lead nào.</p> : (
+              <div className="list-stack">
+                {leads.map((lead) => (
+                  <div key={lead.id} className="list-item compact">
+                    <strong>{lead.full_name}</strong>
+                    <small>
+                      {lead.phone}{lead.email ? ` · ${lead.email}` : ''} · {
+                        lead.source === 'website' ? 'Website' :
+                          lead.source === 'facebook' ? 'Facebook' :
+                            lead.source === 'walkin' ? 'Khách đến trực tiếp' : 'Được giới thiệu'
+                      } · {
+                        lead.status === 'new' ? 'Mới' :
+                          lead.status === 'assigned' ? 'Đã phân công' :
+                            lead.status === 'contacted' ? 'Đã liên hệ' :
+                              lead.status === 'qualified' ? 'Tiềm năng' :
+                                lead.status === 'converted' ? 'Đã đăng ký' : 'Không tiếp tục'
+                      }{lead.assigned_to_name ? ` · Phụ trách: ${lead.assigned_to_name}` : ''}
+                    </small>
+                    {permission === 'F' && <div className="inline-row lead-actions">
+                      <label>Trạng thái<select value={lead.status} onChange={(event) => void updateLead(lead.id, event.target.value)}><option value="new">Mới</option><option value="assigned">Đã phân công</option><option value="contacted">Đã liên hệ</option><option value="qualified">Tiềm năng</option><option value="converted">Đã đăng ký</option><option value="lost">Không tiếp tục</option></select></label>
+                      <label>Người phụ trách<select value={lead.assigned_to_user_id ? String(lead.assigned_to_user_id) : ''} onChange={(event) => void assignLead(lead.id, event.target.value)}><option value="">Chưa phân công</option>{leadAssignees.map((assignee) => <option key={assignee.id} value={String(assignee.id)}>{assignee.full_name}</option>)}</select></label>
+                    </div>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+    )
+  }
+
+  return (
+    <section className="module-landing">
+      <div className="module-icon">{moduleIcons[module]}</div>
+      <p className="eyebrow blue">KHÔNG GIAN NGHIỆP VỤ</p>
+      <h1>{moduleLabels[module]}</h1>
+      <p>Bạn được cấp quyền <strong>{permissionLabel(permission)}</strong> cho chức năng này.</p>
+      <p className="muted">Chức năng nghiệp vụ chi tiết đã được tích hợp trong sprint 2.</p>
+    </section>
+  )
+}
+
+function StatCard({ label, value, detail, icon, tone }: { label: string; value: string | number; detail: string; icon: string; tone: string }) {
+  return <article className="stat-card"><div className={`stat-icon ${tone}`}>{icon}</div><div><p>{label}</p><strong>{value}</strong><small>{detail}</small></div><span className="stat-arrow">↗</span></article>
+}
+
+function Avatar({ name, avatarUrl }: { name: string; avatarUrl?: string | null }) {
+  if (avatarUrl) {
+    return <img className="avatar" src={`${API_URL}${avatarUrl}`} alt={`Ảnh đại diện ${name}`} />
+  }
+  return <span className="avatar">{name.split(' ').map((part) => part[0]).slice(-2).join('').toUpperCase()}</span>
+}
+
+function ProfileModal({
+  user,
+  onClose,
+  onUpdate,
+  onUploadAvatar,
+  onChangePassword,
+  onLogout,
+}: {
+  user: User
+  onClose: () => void
+  onUpdate: (data: { full_name: string; phone: string; date_of_birth: string; address: string }) => Promise<void>
+  onUploadAvatar: (file: File) => Promise<void>
+  onChangePassword: () => void
+  onLogout: () => void
+}) {
+  const [fullName, setFullName] = useState(user.full_name)
+  const [phone, setPhone] = useState(user.phone ?? '')
+  const [dateOfBirth, setDateOfBirth] = useState(user.date_of_birth ?? '')
+  const [address, setAddress] = useState(user.address ?? '')
   const [error, setError] = useState('')
-  async function submit(event: FormEvent<HTMLFormElement>) { event.preventDefault(); const data = new FormData(event.currentTarget); try { await onCreate({ full_name: String(data.get('full_name')), email: String(data.get('email')), password: String(data.get('password')), role: String(data.get('role')) as Role }) } catch (submitError) { setError(submitError instanceof Error ? submitError.message : 'Không thể tạo tài khoản') } }
-  return <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}><section className="modal"><div className="modal-header"><div><p className="eyebrow blue">TÀI KHOẢN MỚI</p><h2>Tạo tài khoản</h2></div><button className="close-button" onClick={onClose}>×</button></div><form onSubmit={submit} className="create-form"><label>Họ và tên<input name="full_name" required /></label><label>Email<input name="email" type="email" required /></label><div className="form-row"><label>Mật khẩu<input name="password" type="password" minLength={8} placeholder="Ít nhất 8 ký tự, gồm chữ hoa, chữ thường, số và ký tự đặc biệt" required /></label><label>Vai trò<select name="role" defaultValue="lecturer"><option value="lecturer">Giảng viên</option><option value="accountant">Kế toán</option><option value="admin">Quản trị viên</option></select></label></div>{error && <div className="form-error">{error}</div>}<div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose}>Hủy</button><button className="primary-button" type="submit">Tạo tài khoản</button></div></form></section></div>
+  const [saving, setSaving] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [avatarPreviewOpen, setAvatarPreviewOpen] = useState(false)
+
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSaving(true)
+    setError('')
+    try {
+      await onUpdate({ full_name: fullName, phone, date_of_birth: dateOfBirth, address })
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Không thể cập nhật hồ sơ.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function selectAvatar(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (!file) return
+    setUploading(true)
+    setError('')
+    try {
+      await onUploadAvatar(file)
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Không thể tải ảnh đại diện.')
+    } finally {
+      setUploading(false)
+      event.target.value = ''
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+      {avatarPreviewOpen && user.avatar_url && (
+        <div className="avatar-preview-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAvatarPreviewOpen(false) }}>
+          <section className="avatar-preview" role="dialog" aria-modal="true" aria-label="Ảnh đại diện kích thước lớn">
+            <button className="close-button" type="button" onClick={() => setAvatarPreviewOpen(false)} aria-label="Đóng ảnh">×</button>
+            <img src={`${API_URL}${user.avatar_url}`} alt={`Ảnh đại diện ${user.full_name}`} />
+          </section>
+        </div>
+      )}
+      <section className="modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title">
+        <div className="modal-header">
+          <div><p className="eyebrow blue">THÔNG TIN CÁ NHÂN</p><h2 id="profile-modal-title">Tài khoản của tôi</h2></div>
+          <button className="close-button" onClick={onClose} aria-label="Đóng">×</button>
+        </div>
+        <div className="profile-summary">
+          {user.avatar_url ? (
+            <button className="profile-avatar-button" type="button" onClick={() => setAvatarPreviewOpen(true)} aria-label="Xem ảnh đại diện kích thước lớn">
+              <Avatar name={user.full_name} avatarUrl={user.avatar_url} />
+            </button>
+          ) : <Avatar name={user.full_name} />}
+          <div><strong>{user.full_name}</strong><span>{user.roles.map((role) => roleLabels[role]).join(', ')}</span></div>
+        </div>
+        {error && <div className="form-error" role="alert">{error}</div>}
+        <form className="stack profile-form-scroll" id="profile-form" onSubmit={saveProfile}>
+          <label>Ảnh đại diện<input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" onChange={(event) => void selectAvatar(event)} disabled={uploading} /></label>
+          <label>Họ và tên<input value={fullName} onChange={(event) => setFullName(event.target.value)} required minLength={2} /></label>
+          <label>Email<input value={user.email} disabled /></label>
+          <label>Số điện thoại<input value={phone} onChange={(event) => setPhone(event.target.value)} /></label>
+          <label>Ngày sinh<input type="date" value={dateOfBirth} onChange={(event) => setDateOfBirth(event.target.value)} /></label>
+          <label>Địa chỉ<textarea className="profile-address" value={address} onChange={(event) => setAddress(event.target.value)} maxLength={500} rows={3} placeholder="Nhập địa chỉ của bạn" /></label>
+        </form>
+        <div className="profile-modal-actions">
+          <button className="primary-button" type="submit" form="profile-form" disabled={saving}>{saving ? 'Đang lưu...' : 'Lưu hồ sơ'}</button>
+          <button className="secondary-button" onClick={onChangePassword}>Đổi mật khẩu</button>
+          <button className="danger-button" onClick={onLogout}>Đăng xuất</button>
+        </div>
+      </section>
+    </div>
+  )
+}
+
+function UsersView({
+  users,
+  page,
+  ownerId,
+  canManage,
+  onQuery,
+  onCreate,
+  onEdit,
+  onDelete,
+  onStatus,
+  onImport,
+  onPreviewImport,
+}: {
+  users: User[]
+  page: UserPage
+  ownerId: number
+  canManage: boolean
+  onQuery: (filters: UserFilters) => Promise<void>
+  onCreate: () => void
+  onEdit: (id: number, data: UserInput) => Promise<void>
+  onDelete: (user: User) => Promise<void>
+  onStatus: (user: User, active: boolean, reason: string) => Promise<void>
+  onImport: (file: File) => Promise<{ imported: number; skipped: number; errors: string[] }>
+  onPreviewImport: (file: File) => Promise<{ valid: number; skipped: number; errors: string[] }>
+}) {
+  const initialFilters = readUserFilters(ownerId)
+  const [query, setQuery] = useState(initialFilters.q)
+  const [roleFilter, setRoleFilter] = useState(initialFilters.role)
+  const [activeFilter, setActiveFilter] = useState(initialFilters.active)
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [importFile, setImportFile] = useState<File | null>(null)
+  const importInput = useRef<HTMLInputElement>(null)
+  const [importResult, setImportResult] = useState<{ imported: number; skipped: number; errors: string[] } | null>(null)
+  const [importPreview, setImportPreview] = useState<{ valid: number; skipped: number; errors: string[] } | null>(null)
+  const [importError, setImportError] = useState('')
+  const [importing, setImporting] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
+  const [editingId, setEditingId] = useState<number | null>(() => {
+    const value = sessionStorage.getItem(`tms:editing-user:${ownerId}`)
+    return value ? Number(value) : null
+  })
+  const [lockingId, setLockingId] = useState<number | null>(() => {
+    const value = sessionStorage.getItem(`tms:locking-user:${ownerId}`)
+    return value ? Number(value) : null
+  })
+  const editing = users.find((item) => item.id === editingId) ?? null
+  const locking = users.find((item) => item.id === lockingId) ?? null
+  const pageCount = Math.max(1, Math.ceil(page.total / page.page_size))
+
+  async function runQuery(filters: UserFilters) {
+    if (searching) return
+    setSearching(true)
+    setSearchError('')
+    try {
+      await onQuery(filters)
+    } catch (error) {
+      setSearchError(error instanceof Error ? error.message : 'Không thể tìm kiếm tài khoản. Vui lòng thử lại.')
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  async function submitImport(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!importFile || !importPreview || importing || importPreview.valid === 0) return
+    setImporting(true)
+    setImportError('')
+    setImportResult(null)
+    try {
+      setImportResult(await onImport(importFile))
+      setImportFile(null)
+      if (importInput.current) importInput.current.value = ''
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : 'Không thể nhập danh sách người dùng.')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  async function previewImport() {
+    if (!importFile || previewing || importing) return
+    setPreviewing(true)
+    setImportError('')
+    setImportResult(null)
+    try {
+      setImportPreview(await onPreviewImport(importFile))
+    } catch (error) {
+      setImportPreview(null)
+      setImportError(error instanceof Error ? error.message : 'Không thể kiểm tra file Excel.')
+    } finally {
+      setPreviewing(false)
+    }
+  }
+
+  async function downloadTemplate() {
+    setImportError('')
+    try {
+      const token = localStorage.getItem('tms_token')
+      const response = await fetch(`${API_URL}/users/import-excel/template`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      })
+      if (!response.ok) throw new Error(vietnameseApiError((await response.json().catch(() => ({}))).detail, response.status))
+      const blob = await response.blob()
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = 'users-template.xlsx'
+      link.click()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : 'Không thể tải file mẫu.')
+    }
+  }
+
+  function submitSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    void runQuery({ q: query, role: roleFilter, active: activeFilter, page: 1 })
+  }
+
+  function updateFilter(role: string, active: string) {
+    setRoleFilter(role)
+    setActiveFilter(active)
+    saveUserFilters(ownerId, { q: query, role, active, page: 1 })
+    void runQuery({ q: query, role, active, page: 1 })
+  }
+
+  function updateQuery(value: string) {
+    setQuery(value)
+    saveUserFilters(ownerId, { q: value, role: roleFilter, active: activeFilter, page: 1 })
+  }
+
+  return (
+    <div className="view">
+      <div className="page-heading">
+        <div><p className="eyebrow blue">QUẢN TRỊ HỆ THỐNG</p><h1>Tài khoản</h1><p className="muted">Quản lý thành viên và quyền truy cập vào hệ thống.</p></div>
+        {canManage && <button className="primary-button" onClick={onCreate}>＋ Tạo tài khoản</button>}
+      </div>
+      {canManage && (
+        <section className="card-panel import-panel">
+          <div className="section-title">
+            <div><h2>Nhập tài khoản từ Excel</h2><p className="muted">Cột bắt buộc: full_name, email, roles. Nhiều vai trò phân tách bằng dấu phẩy; nếu chưa cấu hình email, cần nhập initial_password tối thiểu 8 ký tự.</p></div>
+            <button className="secondary-button" type="button" onClick={() => void downloadTemplate()}>Tải file mẫu</button>
+          </div>
+          <form className="inline-row" onSubmit={(event) => void submitImport(event)}>
+            <label>Chọn file .xlsx<input ref={importInput} type="file" accept=".xlsx" onChange={(event) => { setImportFile(event.target.files?.[0] ?? null); setImportPreview(null); setImportResult(null) }} /></label>
+            <button className="secondary-button" type="button" onClick={() => void previewImport()} disabled={!importFile || previewing || importing}>{previewing ? 'Đang kiểm tra...' : 'Kiểm tra dữ liệu'}</button>
+            <button className="primary-button" type="submit" disabled={!importPreview || importPreview.valid === 0 || importing}>{importing ? 'Đang nhập...' : `Nhập ${importPreview?.valid ?? ''} dòng hợp lệ`}</button>
+          </form>
+          {importError && <div className="form-error" role="alert">{importError}</div>}
+          {importPreview && <div className="form-success" role="status">
+            Kiểm tra xong: {importPreview.valid} dòng hợp lệ, {importPreview.skipped} dòng sẽ bị bỏ qua.
+            {importPreview.errors.length > 0 && <ul>{importPreview.errors.map((item) => <li key={item}>{item}</li>)}</ul>}
+          </div>}
+          {importResult && (
+            <div className="form-success" role="status">
+              Đã nhập {importResult.imported} tài khoản; bỏ qua {importResult.skipped} dòng lỗi.
+              {importResult.errors.length > 0 && <ul>{importResult.errors.map((item) => <li key={item}>{item}</li>)}</ul>}
+            </div>
+          )}
+        </section>
+      )}
+      <section className="table-card">
+        <div className="table-toolbar">
+          <form className="user-filters" onSubmit={submitSearch} noValidate>
+            <div className="search-box">⌕<input placeholder="Tên, email hoặc số điện thoại" value={query} onChange={(event) => updateQuery(event.target.value)} disabled={searching} /></div>
+            <select aria-label="Lọc theo vai trò" value={roleFilter} onChange={(event) => updateFilter(event.target.value, activeFilter)} disabled={searching}>
+              <option value="">Tất cả vai trò</option>
+              {roleOptions.map(([role, label]) => <option key={role} value={role}>{label}</option>)}
+            </select>
+            <select aria-label="Lọc theo trạng thái" value={activeFilter} onChange={(event) => updateFilter(roleFilter, event.target.value)} disabled={searching}>
+              <option value="">Mọi trạng thái</option><option value="true">Đang hoạt động</option><option value="false">Đã khóa</option>
+            </select>
+            <button className="secondary-button search-submit" type="submit" disabled={searching} aria-busy={searching}>
+              {searching ? 'Đang tìm...' : 'Tìm kiếm'}
+            </button>
+          </form>
+          <span className="table-count">{page.total} tài khoản</span>
+        </div>
+        {searchError && <div className="form-error search-error" role="alert">{searchError}</div>}
+        <div className="table-scroll">
+          <table>
+            <thead><tr><th>Người dùng</th><th>Vai trò</th><th>Trạng thái</th><th>Ngày tạo</th><th /></tr></thead>
+            <tbody>
+              {users.map((item) => (
+                <tr key={item.id}>
+                  <td><div className="user-cell"><Avatar name={item.full_name} avatarUrl={item.avatar_url} /><span><strong>{item.full_name}</strong><small>{item.email}{item.phone ? ` · ${item.phone}` : ''}</small></span></div></td>
+                  <td>{item.roles.map((role) => roleLabels[role]).join(', ')}</td>
+                  <td><span className={item.is_active ? 'status-pill active' : 'status-pill locked'}><i />{item.is_active ? 'Hoạt động' : 'Đã khóa'}</span>{item.lock_reason && <small className="lock-reason">{item.lock_reason}</small>}</td>
+                  <td className="date-cell">{new Date(item.created_at).toLocaleDateString('vi-VN')}</td>
+                  {canManage ? (
+                    <td className="row-actions">
+                      <button className="row-action" onClick={() => { sessionStorage.setItem(`tms:editing-user:${ownerId}`, String(item.id)); setEditingId(item.id) }}>Sửa</button>
+                      {item.is_active
+                        ? <button className="row-action danger" onClick={() => { sessionStorage.setItem(`tms:locking-user:${ownerId}`, String(item.id)); setLockingId(item.id) }}>Khóa</button>
+                        : <button className="row-action" onClick={() => void onStatus(item, true, '').catch(() => undefined)}>Mở khóa</button>}
+                    </td>
+                  ) : <td />}
+                </tr>
+              ))}
+              {users.length === 0 && <tr><td colSpan={5} className="empty-users">Không tìm thấy tài khoản phù hợp.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <div className="pagination">
+          <span>Trang {page.page} / {pageCount} · Hiển thị tối đa 20 tài khoản</span>
+          <div>
+            <button className="secondary-button" disabled={page.page <= 1 || searching} onClick={() => void runQuery({ q: query, role: roleFilter, active: activeFilter, page: page.page - 1 })}>Trước</button>
+            <button className="secondary-button" disabled={page.page >= pageCount || searching} onClick={() => void runQuery({ q: query, role: roleFilter, active: activeFilter, page: page.page + 1 })}>Sau</button>
+          </div>
+        </div>
+      </section>
+      {canManage && editing && <UserModal ownerId={ownerId} user={editing} title="Chỉnh sửa tài khoản" onClose={() => { sessionStorage.removeItem(`tms:editing-user:${ownerId}`); setEditingId(null) }} onSave={async (data) => { await onEdit(editing.id, data); sessionStorage.removeItem(`tms:editing-user:${ownerId}`); setEditingId(null) }} onDelete={async () => { await onDelete(editing); sessionStorage.removeItem(`tms:editing-user:${ownerId}`); setEditingId(null) }} />
+      }
+      {canManage && locking && <LockUserModal reasonKey={`tms:lock-reason:${ownerId}:${locking.id}`} user={locking} onClose={() => { sessionStorage.removeItem(`tms:locking-user:${ownerId}`); sessionStorage.removeItem(`tms:lock-reason:${ownerId}:${locking.id}`); setLockingId(null) }} onConfirm={async (reason) => { await onStatus(locking, false, reason); sessionStorage.removeItem(`tms:locking-user:${ownerId}`); sessionStorage.removeItem(`tms:lock-reason:${ownerId}:${locking.id}`); setLockingId(null) }} />}
+    </div>
+  )
+}
+
+function RolePicker({ selected, onChange }: { selected: Role[]; onChange: (roles: Role[]) => void }) {
+  return (
+    <fieldset className="role-picker">
+      <legend>Vai trò (có thể chọn nhiều)</legend>
+      <div className="role-options">
+        {roleOptions.map(([role, label]) => (
+          <label className="role-option" key={role}>
+            <input type="checkbox" checked={selected.includes(role)} onChange={(event) => {
+              onChange(event.target.checked ? [...selected, role] : selected.filter((value) => value !== role))
+            }} />
+            {label}
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  )
+}
+
+function UserModal({ user, ownerId, title, onClose, onSave, onDelete }: { user?: User; ownerId: number; title: string; onClose: () => void; onSave: (data: UserInput) => Promise<void>; onDelete?: () => Promise<void> }) {
+  const [error, setError] = useState('')
+  const [deleteError, setDeleteError] = useState('')
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [nameError, setNameError] = useState('')
+  const [emailError, setEmailError] = useState('')
+  const [rolesError, setRolesError] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const draftKey = `tms:user-draft:${ownerId}:${user?.id ?? 'new'}`
+  const savedDraft = readUserDraft(draftKey)
+  const [name, setName] = useState(savedDraft?.full_name ?? user?.full_name ?? '')
+  const [email, setEmail] = useState(savedDraft?.email ?? user?.email ?? '')
+  const [phone, setPhone] = useState(savedDraft?.phone ?? user?.phone ?? '')
+  const [roles, setRoles] = useState<Role[]>(savedDraft?.roles ?? user?.roles ?? ['instructor'])
+  const [assignedClasses, setAssignedClasses] = useState((savedDraft?.assigned_classes ?? user?.assigned_classes ?? []).join(', '))
+
+  function saveDraft(update: Partial<UserInput>) {
+    sessionStorage.setItem(draftKey, JSON.stringify({
+      full_name: name,
+      email,
+      phone,
+      roles,
+      assigned_classes: assignedClasses.split(',').map((value) => value.trim()).filter(Boolean),
+      ...update,
+    }))
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const nextNameError = name.trim().length < 2 ? 'Vui lòng nhập họ và tên (ít nhất 2 ký tự).' : ''
+    const nextEmailError = !email.trim()
+      ? 'Vui lòng nhập email.'
+      : !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+        ? 'Vui lòng nhập địa chỉ email hợp lệ.'
+        : ''
+    const nextRolesError = roles.length === 0 ? 'Vui lòng chọn ít nhất một vai trò.' : ''
+    setNameError(nextNameError)
+    setEmailError(nextEmailError)
+    setRolesError(nextRolesError)
+    setError('')
+    if (nextNameError || nextEmailError || nextRolesError) {
+      return
+    }
+    setSaving(true)
+    try {
+      await onSave({
+        full_name: name.trim(),
+        email: email.trim(),
+        phone,
+        roles,
+        assigned_classes: assignedClasses.split(',').map((value) => value.trim()).filter(Boolean),
+      })
+      sessionStorage.removeItem(draftKey)
+    } catch (submitError) {
+      const message = submitError instanceof Error ? submitError.message : 'Không thể lưu tài khoản.'
+      if (message.toLocaleLowerCase('vi').includes('email')) {
+        setEmailError(message)
+      } else {
+        setError(message)
+      }
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function submitDelete() {
+    if (!onDelete || !user) return
+    setDeleting(true)
+    setDeleteError('')
+    try {
+      await onDelete()
+    } catch (deleteFailure) {
+      setDeleteError(deleteFailure instanceof Error ? deleteFailure.message : 'Không thể xóa tài khoản. Vui lòng thử lại.')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  function close() {
+    sessionStorage.removeItem(draftKey)
+    onClose()
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) close() }}>
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="user-modal-title">
+        <div className="modal-header"><div><p className="eyebrow blue">THÔNG TIN TÀI KHOẢN</p><h2 id="user-modal-title">{title}</h2></div><button className="close-button" onClick={close} aria-label="Đóng">×</button></div>
+        <form onSubmit={submit} className="create-form" noValidate>
+          <label>Họ và tên<input value={name} onChange={(event) => { const value = event.target.value; saveDraft({ full_name: value }); setName(value); if (value.trim().length >= 2) setNameError('') }} onBlur={() => { if (name.trim().length < 2) setNameError('Vui lòng nhập họ và tên (ít nhất 2 ký tự).') }} minLength={2} required aria-invalid={Boolean(nameError)} aria-describedby={nameError ? 'user-name-error' : undefined} />{nameError && <span className="field-error" id="user-name-error">{nameError}</span>}</label>
+          <label>Email<input value={email} onChange={(event) => { const value = event.target.value; saveDraft({ email: value }); setEmail(value); if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())) setEmailError('') }} onBlur={() => { const value = email.trim(); setEmailError(!value ? 'Vui lòng nhập email.' : !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) ? 'Vui lòng nhập địa chỉ email hợp lệ.' : '') }} type="email" required aria-invalid={Boolean(emailError)} aria-describedby={emailError ? 'user-email-error' : undefined} />{emailError && <span className="field-error" id="user-email-error" role="alert">{emailError}</span>}</label>
+          <label>Số điện thoại<input value={phone} onChange={(event) => { saveDraft({ phone: event.target.value }); setPhone(event.target.value) }} type="tel" maxLength={40} /></label>
+          <label>Lớp phụ trách (phân cách bằng dấu phẩy)<input value={assignedClasses} onChange={(event) => { const value = event.target.value; saveDraft({ assigned_classes: value.split(',').map((item) => item.trim()).filter(Boolean) }); setAssignedClasses(value) }} placeholder="Ví dụ: TMS-K14, TMS-K15" /></label>
+          <RolePicker selected={roles} onChange={(value) => { saveDraft({ roles: value }); setRoles(value); if (value.length > 0) setRolesError('') }} />
+          {rolesError && <span className="field-error" role="alert">{rolesError}</span>}
+          {!user && <p className="form-hint">Hệ thống sẽ gửi email kích hoạt kèm mật khẩu tạm; người dùng cần đổi mật khẩu ở lần đăng nhập đầu tiên.</p>}
+          {error && <div className="form-error" role="alert">{error}</div>}
+          {user && onDelete && user.id !== ownerId && (
+            <div className="delete-account">
+              {!confirmDelete ? (
+                <button type="button" className="row-action danger" onClick={() => { setConfirmDelete(true); setDeleteError('') }}>Xóa tài khoản</button>
+              ) : (
+                <div className="delete-confirmation" role="alert">
+                  <p>Xóa vĩnh viễn tài khoản <strong>{user.email}</strong>? Thao tác này không thể hoàn tác.</p>
+                  {deleteError && <span className="field-error">{deleteError}</span>}
+                  <div className="modal-actions">
+                    <button type="button" className="secondary-button" disabled={deleting} onClick={() => setConfirmDelete(false)}>Hủy</button>
+                    <button type="button" className="danger-button" disabled={deleting} onClick={() => void submitDelete()}>{deleting ? 'Đang xóa...' : 'Xác nhận xóa vĩnh viễn'}</button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+          {user && onDelete && user.id === ownerId && <p className="form-hint">Không thể tự xóa tài khoản đang đăng nhập.</p>}
+          <div className="modal-actions"><button type="button" className="secondary-button" onClick={close}>Hủy</button><button className="primary-button" type="submit" disabled={saving || deleting}>{saving ? 'Đang lưu...' : user ? 'Lưu thay đổi' : 'Tạo tài khoản'}</button></div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+function LockUserModal({ user, reasonKey, onClose, onConfirm }: { user: User; reasonKey: string; onClose: () => void; onConfirm: (reason: string) => Promise<void> }) {
+  const [reason, setReason] = useState(sessionStorage.getItem(reasonKey) ?? '')
+  const [error, setError] = useState('')
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!reason.trim()) {
+      setError('Vui lòng nhập lý do khóa tài khoản.')
+      return
+    }
+    try {
+      await onConfirm(reason)
+      sessionStorage.removeItem(`tms:lock-reason:${user.id}`)
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'Không thể khóa tài khoản')
+    }
+  }
+  return (
+    <div className="modal-backdrop">
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="lock-modal-title">
+        <div className="modal-header"><div><p className="eyebrow blue">THU HỒI TRUY CẬP</p><h2 id="lock-modal-title">Khóa tài khoản</h2></div><button className="close-button" onClick={onClose} aria-label="Đóng">×</button></div>
+        <form onSubmit={submit} className="create-form" noValidate>
+          <p className="muted">Tài khoản của {user.full_name} sẽ bị đăng xuất khỏi mọi phiên đang mở.</p>
+          <label>Lý do khóa<textarea value={reason} onChange={(event) => { sessionStorage.setItem(reasonKey, event.target.value); setReason(event.target.value) }} rows={3} maxLength={500} required /></label>
+          {error && <div className="form-error" role="alert">{error}</div>}
+          <div className="modal-actions"><button type="button" className="secondary-button" onClick={onClose}>Hủy</button><button className="primary-button" type="submit">Xác nhận khóa</button></div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+function ChangePasswordModal({ required, onClose, onChange }: { required: boolean; onClose: () => void; onChange: (data: { current_password: string; new_password: string }) => Promise<void> }) {
+  const [error, setError] = useState('')
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const data = new FormData(event.currentTarget)
+    const currentPassword = String(data.get('current_password') ?? '')
+    const nextPassword = String(data.get('new_password') ?? '')
+    if (!currentPassword) {
+      setError('Vui lòng nhập mật khẩu hiện tại.')
+      return
+    }
+    if (nextPassword.length < 8 || !/[A-Za-z]/.test(nextPassword) || !/\d/.test(nextPassword)) {
+      setError('Mật khẩu mới phải có ít nhất 8 ký tự, gồm chữ cái và chữ số.')
+      return
+    }
+    try {
+      await onChange({ current_password: currentPassword, new_password: nextPassword })
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : 'Không thể đổi mật khẩu')
+    }
+  }
+  return (
+    <div className="modal-backdrop">
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="password-modal-title">
+        <div className="modal-header"><div><p className="eyebrow blue">BẢO MẬT TÀI KHOẢN</p><h2 id="password-modal-title">Đổi mật khẩu</h2></div>{!required && <button className="close-button" onClick={onClose} aria-label="Đóng">×</button>}</div>
+        {required && <p className="form-hint">Đây là mật khẩu tạm. Hãy đổi mật khẩu trước khi tiếp tục sử dụng hệ thống.</p>}
+        <form onSubmit={submit} className="create-form" noValidate>
+          <label>Mật khẩu hiện tại<PasswordInput name="current_password" autoComplete="current-password" required /></label>
+          <label>Mật khẩu mới<PasswordInput name="new_password" minLength={8} autoComplete="new-password" required /></label>
+          <p className="form-hint">Mật khẩu tối thiểu 8 ký tự, bao gồm ít nhất một chữ cái và một chữ số.</p>
+          {error && <div className="form-error" role="alert">{error}</div>}
+          <div className="modal-actions">{!required && <button type="button" className="secondary-button" onClick={onClose}>Hủy</button>}<button className="primary-button" type="submit">Cập nhật mật khẩu</button></div>
+        </form>
+      </section>
+    </div>
+  )
 }
 
 export default App
