@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ChangeEvent, FormEvent, InputHTMLAttributes } from 'react'
+import type { ChangeEvent, DragEvent, FormEvent, InputHTMLAttributes } from 'react'
 import './App.css'
 
 type Role =
@@ -46,6 +46,20 @@ type User = {
 type UserPage = { items: User[]; total: number; page: number; page_size: number }
 type Summary = { greeting: string; total_users: number; active_users: number; locked_users: number }
 type UserFilters = { q: string; role: string; active: string; page: number }
+type ImportPreviewRow = {
+  row_number: number
+  full_name: string
+  email: string
+  roles: string[]
+  phone: string | null
+  assigned_classes: string[]
+}
+type ImportPreview = {
+  valid: number
+  skipped: number
+  errors: string[]
+  preview_rows: ImportPreviewRow[]
+}
 type UserInput = {
   full_name: string
   email: string
@@ -64,6 +78,19 @@ class ApiError extends Error {
     this.status = status
     this.retryAfterSeconds = retryAfterSeconds
   }
+}
+
+function TransientMessage({ message, tone = 'success' }: { message: string; tone?: 'success' | 'error' }) {
+  const [expired, setExpired] = useState(false)
+
+  useEffect(() => {
+    if (!message || tone !== 'success') return
+    const timer = window.setTimeout(() => setExpired(true), 10_000)
+    return () => window.clearTimeout(timer)
+  }, [message, tone])
+
+  if (!message || expired) return null
+  return <div className={tone === 'success' ? 'form-success' : 'form-error'} role={tone === 'error' ? 'alert' : 'status'}>{message}</div>
 }
 
 type LoginLock = { email: string; until: number }
@@ -274,8 +301,9 @@ async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T
         ...options.headers,
       },
     })
-  } catch {
-    throw new Error('Không thể kết nối đến máy chủ. Vui lòng kiểm tra kết nối hoặc thử lại sau.')
+  } catch (error) {
+    const reason = error instanceof Error && error.message ? ` (${error.message})` : ''
+    throw new Error(`Không thể kết nối API tại ${API_URL}. Hãy kiểm tra máy chủ backend đang chạy.${reason}`)
   }
   if (!response.ok) {
     const error = (await response.json().catch(() => ({ detail: 'Có lỗi xảy ra' }))) as {
@@ -288,7 +316,7 @@ async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T
           detail: message,
         }),
       )
-    } else if (response.status === 403) {
+    } else if (response.status === 403 && path !== '/auth/login') {
       window.dispatchEvent(new CustomEvent('tms:access-denied', { detail: message }))
     }
     const retryAfterHeader = response.headers.get('Retry-After')
@@ -324,15 +352,33 @@ function App() {
   })
   const [passwordOpen, setPasswordOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false)
   const [notice, setNotice] = useState('')
   const [noticeTone, setNoticeTone] = useState<'success' | 'error'>('error')
+  const [noticeVersion, setNoticeVersion] = useState(0)
   const [accessError, setAccessError] = useState('')
   const lastActivityWrite = useRef(0)
+
+  useEffect(() => {
+    if (!accountMenuOpen) return
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setAccountMenuOpen(false)
+    }
+    document.addEventListener('keydown', closeOnEscape)
+    return () => document.removeEventListener('keydown', closeOnEscape)
+  }, [accountMenuOpen])
 
   function showNotice(message: string, tone: 'success' | 'error' = 'error') {
     setNoticeTone(tone)
     setNotice(message)
+    setNoticeVersion((version) => version + 1)
   }
+
+  useEffect(() => {
+    if (!notice || noticeTone !== 'success') return
+    const timer = window.setTimeout(() => setNotice(''), 10_000)
+    return () => window.clearTimeout(timer)
+  }, [notice, noticeTone, noticeVersion])
 
   useEffect(() => {
     const localizeInvalidField = (event: Event) => {
@@ -388,6 +434,7 @@ function App() {
       setUserPage(null)
       setPasswordOpen(false)
       setProfileOpen(false)
+      setAccountMenuOpen(false)
       setAccessError('')
       setLoginError(detail)
     }
@@ -430,6 +477,8 @@ function App() {
 
   function navigate(nextView: AppView) {
     if (!user) return
+    setProfileOpen(false)
+    setAccountMenuOpen(false)
     sessionStorage.setItem('tms:current-view', nextView)
     sessionStorage.setItem('tms:view-owner', String(user.id))
     setView(nextView)
@@ -582,6 +631,7 @@ function App() {
     setView('overview')
     setCreateOpenFor(null)
     setProfileOpen(false)
+    setAccountMenuOpen(false)
     setLoginSuccess('Đăng xuất thành công. Phiên đăng nhập đã được thu hồi.')
     setAccessError('')
     clearSessionDrafts()
@@ -767,7 +817,7 @@ function App() {
   async function previewUsersImport(file: File) {
     const formData = new FormData()
     formData.append('file', file)
-    return apiRequest<{ valid: number; skipped: number; errors: string[] }>('/users/import-excel/preview', {
+    return apiRequest<ImportPreview>('/users/import-excel/preview', {
       method: 'POST',
       body: formData,
     })
@@ -828,19 +878,6 @@ function App() {
           <button onClick={() => setNotice('')} aria-label="Đóng thông báo">×</button>
         </div>
       )}
-      {profileOpen && (
-        <ProfileModal
-          user={user}
-          onClose={() => setProfileOpen(false)}
-          onUpdate={updateProfile}
-          onUploadAvatar={uploadAvatar}
-          onChangePassword={() => {
-            setProfileOpen(false)
-            setPasswordOpen(true)
-          }}
-          onLogout={() => void logout()}
-        />
-      )}
       <aside className="sidebar">
         <div className="brand">
           <img className="institution-logo" src="/ictu-logo.png" alt="Biểu trưng ICTU" />
@@ -869,25 +906,47 @@ function App() {
             </button>
           )}
         </nav>
-        <div className="sidebar-bottom">
-          <div className="profile-actions">
-            <button className="profile-mini" onClick={() => setProfileOpen(true)} aria-label="Mở thông tin cá nhân" title="Thông tin cá nhân">
-              <Avatar name={user.full_name} avatarUrl={user.avatar_url} />
-              <span className="profile-label"><strong>{user.full_name}</strong><small>{user.roles.map((role) => roleLabels[role]).join(', ')}</small></span>
-              <span className="profile-chevron" aria-hidden="true">›</span>
-            </button>
-          </div>
-        </div>
       </aside>
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumb">Hệ thống / <strong>{selectedModule && currentView === view ? moduleLabels[selectedModule] : currentView === 'overview' ? 'Tổng quan' : 'Tài khoản'}</strong></div>
+          <div className={profileOpen ? 'breadcrumb profile-breadcrumb' : 'breadcrumb'}>
+            {profileOpen ? <strong>THÔNG TIN TÀI KHOẢN</strong> : <>Hệ thống / <strong>{selectedModule && currentView === view ? moduleLabels[selectedModule] : currentView === 'overview' ? 'Tổng quan' : 'Tài khoản'}</strong></>}
+          </div>
           <div className="topbar-actions">
             <span className="status-dot" />Hệ thống đang hoạt động
+            <div className={`topbar-account${accountMenuOpen ? ' menu-open' : ''}`}>
+              <button
+                className="topbar-account-toggle"
+                type="button"
+                aria-label={accountMenuOpen ? 'Đóng menu tài khoản' : 'Mở menu tài khoản'}
+                aria-expanded={accountMenuOpen}
+                aria-controls="account-menu"
+                onClick={() => setAccountMenuOpen((open) => !open)}
+              >
+                <Avatar name={user.full_name} avatarUrl={user.avatar_url} />
+                <span className="topbar-account-label"><strong>{user.full_name}</strong><small>{user.roles.map((role) => roleLabels[role]).join(', ')}</small></span>
+                <span className="topbar-account-menu-icon" aria-hidden="true"><i /><i /><i /></span>
+              </button>
+              <div className="account-menu" id="account-menu" aria-label="Menu tài khoản" hidden={!accountMenuOpen}>
+                <button type="button" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setProfileOpen(true) }}>
+                  <span aria-hidden="true">♙</span>Thông tin tài khoản
+                </button>
+                {!user.must_change_password && (
+                  <button type="button" className="account-menu-item" onClick={() => { setAccountMenuOpen(false); setPasswordOpen(true) }}>
+                    <span aria-hidden="true">♧</span>Đổi mật khẩu
+                  </button>
+                )}
+                <button type="button" className="account-menu-item account-menu-logout" onClick={() => { setAccountMenuOpen(false); void logout() }}>
+                  <span aria-hidden="true">⇥</span>Đăng xuất
+                </button>
+              </div>
+            </div>
           </div>
         </header>
-        <div className="content-wrap">
-          {currentView === 'overview' ? (
+        <div className={profileOpen ? 'content-wrap profile-content-wrap' : 'content-wrap'}>
+          {profileOpen ? (
+            <ProfileView user={user} onUpdate={updateProfile} onUploadAvatar={uploadAvatar} />
+          ) : currentView === 'overview' ? (
             <Overview user={user} summary={summary} onUsers={() => navigate('users')} canViewUsers={canViewUsers(user)} onModule={(module) => navigate(`module:${module}`)} />
           ) : currentView === 'users' && userPage ? (
             <UsersView
@@ -907,7 +966,7 @@ function App() {
               onPreviewImport={previewUsersImport}
             />
           ) : selectedModule && selectedModulePermission ? (
-            <ModuleLanding module={selectedModule} permission={selectedModulePermission} />
+            <ModuleLanding module={selectedModule} permission={selectedModulePermission} canDeleteLeads={user.roles.includes('training_manager')} />
           ) : (
             <div className="page-loader">Đang tải danh sách tài khoản...</div>
           )}
@@ -1045,7 +1104,7 @@ function LoginPage({
                   </form>
                 </>
               )}
-              {forgotMessage && <div className="form-success" role="status">{forgotMessage}</div>}
+              {forgotMessage && <TransientMessage key={`reset-${forgotMessage}`} message={forgotMessage} />}
               {forgotError && <div className="form-error" role="alert">{forgotError}</div>}
               <button className="link-button back-link" onClick={() => { setForgot(false); setForgotMessage(''); setForgotError(''); setResetToken('') }}>← Quay lại đăng nhập</button>
             </>
@@ -1054,8 +1113,8 @@ function LoginPage({
               <p className="eyebrow blue">CHÀO MỪNG QUAY TRỞ LẠI</p>
               <h2>Đăng nhập</h2>
               <p className="form-intro">Đăng nhập để tiếp tục với không gian làm việc của bạn.</p>
-              {success && <div className="form-success" role="status">{success}</div>}
-              {forgotMessage && <div className="form-success" role="status">{forgotMessage}</div>}
+              {success && <TransientMessage key={`login-${success}`} message={success} />}
+              {forgotMessage && <TransientMessage key={`reset-${forgotMessage}`} message={forgotMessage} />}
               <form onSubmit={onSubmit} className="login-form" noValidate>
                 <label>Email công việc<input name="email" type="email" value={email} onChange={(event) => { setEmail(event.target.value); localStorage.setItem('tms_login_email', event.target.value); onEmailChange(event.target.value) }} required /></label>
                 <label>Mật khẩu<PasswordInput name="password" autoComplete="current-password" required /></label>
@@ -1079,6 +1138,7 @@ function LoginPage({
 function PublicLeadPage() {
   const [form, setForm] = useState({ full_name: '', phone: '', email: '', program_interest: '', notes: '' })
   const [message, setMessage] = useState('')
+  const [messageVersion, setMessageVersion] = useState(0)
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -1094,6 +1154,7 @@ function PublicLeadPage() {
         body: JSON.stringify({ ...form, source: 'website', website: String(data.get('website') ?? '') }),
       })
       setMessage(result.message)
+      setMessageVersion((version) => version + 1)
       setForm({ full_name: '', phone: '', email: '', program_interest: '', notes: '' })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Không thể gửi đăng ký tư vấn.')
@@ -1108,14 +1169,14 @@ function PublicLeadPage() {
         <p className="eyebrow blue">TƯ VẤN TUYỂN SINH</p>
         <h1>Đăng ký nhận tư vấn</h1>
         <p className="muted">Để lại thông tin, bộ phận tuyển sinh sẽ sớm liên hệ với bạn.</p>
-        {message && <div className="form-success" role="status">{message}</div>}
+        {message && <TransientMessage key={`${messageVersion}-${message}`} message={message} />}
         {error && <div className="form-error" role="alert">{error}</div>}
         <form className="stack" onSubmit={(event) => void submit(event)}>
-          <label>Họ và tên<input value={form.full_name} onChange={(event) => setForm({ ...form, full_name: event.target.value })} required /></label>
-          <label>Số điện thoại<input type="tel" value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} required /></label>
-          <label>Email<input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} /></label>
-          <label>Chương trình quan tâm<input value={form.program_interest} onChange={(event) => setForm({ ...form, program_interest: event.target.value })} /></label>
-          <label>Ghi chú<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>
+          <label>Họ và tên<input value={form.full_name} onChange={(event) => setForm({ ...form, full_name: event.target.value })} placeholder="Ví dụ: Nguyễn Văn An" required /></label>
+          <label>Số điện thoại<input type="tel" value={form.phone} onChange={(event) => setForm({ ...form, phone: event.target.value })} placeholder="Ví dụ: 0912345678" required /></label>
+          <label>Email<input type="email" value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Ví dụ: an@example.com (không bắt buộc)" /></label>
+          <label>Chương trình quan tâm<input value={form.program_interest} onChange={(event) => setForm({ ...form, program_interest: event.target.value })} placeholder="Tên khóa học muốn tìm hiểu, ví dụ: Lập trình Web" /><small className="field-hint">Nhập lĩnh vực hoặc khóa học bạn muốn được tư vấn; nếu chưa rõ, có thể để trống.</small></label>
+          <label>Ghi chú<textarea value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} placeholder="Ví dụ: Thời gian thuận tiện để liên hệ hoặc câu hỏi bạn muốn được giải đáp." /></label>
           <label className="lead-honeypot" aria-hidden="true">Website<input name="website" tabIndex={-1} autoComplete="off" /></label>
           <button className="primary-button" type="submit" disabled={submitting}>{submitting ? 'Đang gửi...' : 'Gửi đăng ký'}</button>
         </form>
@@ -1189,7 +1250,7 @@ function permissionLabel(permission: 'R' | 'W' | 'F' | null) {
   return 'Không truy cập'
 }
 
-function ModuleLanding({ module, permission }: { module: ModuleId; permission: 'R' | 'W' | 'F' }) {
+function ModuleLanding({ module, permission, canDeleteLeads }: { module: ModuleId; permission: 'R' | 'W' | 'F'; canDeleteLeads: boolean }) {
   type Program = {
     id: number
     code: string
@@ -1238,6 +1299,7 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
     created_at: string
   }
   type LeadAssignee = { id: number; full_name: string }
+  type LeadInteraction = { id: number; action: string; note: string; user_name: string; created_at: string }
 
   const [programs, setPrograms] = useState<Program[]>([])
   const [selectedProgramId, setSelectedProgramId] = useState<number | null>(null)
@@ -1250,8 +1312,16 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
   const [draggedAssociationId, setDraggedAssociationId] = useState<number | null>(null)
   const [leads, setLeads] = useState<LeadRecord[]>([])
   const [leadAssignees, setLeadAssignees] = useState<LeadAssignee[]>([])
-  const [leadFilters, setLeadFilters] = useState({ q: '', status: '', source: '' })
+  const [leadFilters, setLeadFilters] = useState({ q: '', status: '', source: '', assigned_to: '', from_date: '', to_date: '' })
+  const [selectedLeadIds, setSelectedLeadIds] = useState<number[]>([])
+  const [bulkAssigneeId, setBulkAssigneeId] = useState('')
+  const [editingLeadId, setEditingLeadId] = useState<number | null>(null)
+  const [duplicateWarning, setDuplicateWarning] = useState('')
+  const [expandedLeadId, setExpandedLeadId] = useState<number | null>(null)
+  const [leadInteractions, setLeadInteractions] = useState<LeadInteraction[]>([])
+  const [interactionNote, setInteractionNote] = useState('')
   const [leadError, setLeadError] = useState('')
+  const [retryingLeadConnection, setRetryingLeadConnection] = useState(false)
   const [programForm, setProgramForm] = useState({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' })
   const [subjectForm, setSubjectForm] = useState({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' })
   const [editingProgramId, setEditingProgramId] = useState<number | null>(null)
@@ -1261,6 +1331,14 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
   const [sessionForm, setSessionForm] = useState({ sequence: '1', title: '', objectives: '' })
   const [cloneSourceSubjectId, setCloneSourceSubjectId] = useState('')
   const [statusMessage, setStatusMessage] = useState('')
+  const [statusTone, setStatusTone] = useState<'success' | 'error'>('success')
+  const [statusVersion, setStatusVersion] = useState(0)
+
+  function showStatus(message: string, tone: 'success' | 'error' = 'success') {
+    setStatusTone(tone)
+    setStatusMessage(message)
+    setStatusVersion((version) => version + 1)
+  }
 
   async function loadPrograms() {
     const next = await apiRequest<Program[]>('/training/programs', { method: 'GET' })
@@ -1297,14 +1375,35 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
     if (filters.q.trim()) params.set('q', filters.q.trim())
     if (filters.status) params.set('status', filters.status)
     if (filters.source) params.set('source', filters.source)
+    if (filters.assigned_to) params.set('assigned_to', filters.assigned_to)
+    if (filters.from_date) params.set('from_date', filters.from_date)
+    if (filters.to_date) params.set('to_date', filters.to_date)
     const next = await apiRequest<LeadRecord[]>(`/leads${params.size ? `?${params.toString()}` : ''}`, { method: 'GET' })
     setLeads(next)
+    setSelectedLeadIds((current) => current.filter((id) => next.some((lead) => lead.id === id)))
+    setLeadError('')
+  }
+
+  async function retryLeadConnection() {
+    if (retryingLeadConnection) return
+    setRetryingLeadConnection(true)
+    setLeadError('')
+    try {
+      await loadLeads()
+      if (permission === 'F') {
+        setLeadAssignees(await apiRequest<LeadAssignee[]>('/leads/assignees', { method: 'GET' }))
+      }
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể tải dữ liệu tuyển sinh.')
+    } finally {
+      setRetryingLeadConnection(false)
+    }
   }
 
   useEffect(() => {
     if (module === 'courses') {
-      void loadPrograms().catch((error: Error) => setStatusMessage(error.message))
-      void loadSubjects().catch((error: Error) => setStatusMessage(error.message))
+      void loadPrograms().catch((error: Error) => showStatus(error.message, 'error'))
+      void loadSubjects().catch((error: Error) => showStatus(error.message, 'error'))
     }
     if (module === 'leads') {
       void loadLeads().catch((error: Error) => setLeadError(error.message))
@@ -1318,14 +1417,14 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
 
   useEffect(() => {
     if (module === 'courses' && selectedProgramId) {
-      void loadProgramSubjects(selectedProgramId).catch((error: Error) => setStatusMessage(error.message))
-      void loadTrainingClasses(selectedProgramId).catch((error: Error) => setStatusMessage(error.message))
+      void loadProgramSubjects(selectedProgramId).catch((error: Error) => showStatus(error.message, 'error'))
+      void loadTrainingClasses(selectedProgramId).catch((error: Error) => showStatus(error.message, 'error'))
     }
   }, [module, selectedProgramId])
 
   useEffect(() => {
     if (module === 'courses' && selectedSubjectId) {
-      void loadSubjectSessions(selectedSubjectId).catch((error: Error) => setStatusMessage(error.message))
+      void loadSubjectSessions(selectedSubjectId).catch((error: Error) => showStatus(error.message, 'error'))
     }
   }, [module, selectedSubjectId])
 
@@ -1345,11 +1444,11 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         body: JSON.stringify(payload),
       })
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu chương trình.')
+      showStatus(error instanceof Error ? error.message : 'Không thể lưu chương trình.', 'error')
       return
     }
     setProgramForm({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' })
-    setStatusMessage(editingProgramId ? 'Đã cập nhật chương trình đào tạo.' : 'Đã lưu chương trình đào tạo.')
+    showStatus(editingProgramId ? 'Đã cập nhật chương trình đào tạo.' : 'Đã lưu chương trình đào tạo.')
     setEditingProgramId(null)
     void loadPrograms()
   }
@@ -1370,14 +1469,14 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
     if (!window.confirm(`Xóa chương trình ${program.name}? Các liên kết môn học và hồ sơ lớp không còn diễn ra sẽ bị xóa. Chương trình đang có lớp diễn ra không thể xóa.`)) return
     try {
       await apiRequest(`/training/programs/${program.id}`, { method: 'DELETE' })
-      setStatusMessage('Đã xóa chương trình đào tạo.')
+      showStatus('Đã xóa chương trình đào tạo.')
       if (editingProgramId === program.id) {
         setEditingProgramId(null)
         setProgramForm({ code: '', name: '', description: '', total_duration_hours: '0', standard_fee: '0', status: 'active' })
       }
       await loadPrograms()
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể xóa chương trình.')
+      showStatus(error instanceof Error ? error.message : 'Không thể xóa chương trình.', 'error')
     }
   }
 
@@ -1397,11 +1496,11 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         body: JSON.stringify(payload),
       })
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu môn học.')
+      showStatus(error instanceof Error ? error.message : 'Không thể lưu môn học.', 'error')
       return
     }
     setSubjectForm({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' })
-    setStatusMessage(editingSubjectId ? 'Đã cập nhật môn học.' : 'Đã lưu môn học.')
+    showStatus(editingSubjectId ? 'Đã cập nhật môn học.' : 'Đã lưu môn học.')
     setEditingSubjectId(null)
     void loadSubjects()
   }
@@ -1422,7 +1521,7 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
     if (!window.confirm(`Xóa môn học ${subject.name}? Môn sẽ được gỡ khỏi tất cả chương trình và không thể xóa khi đang được dùng trong lớp diễn ra.`)) return
     try {
       await apiRequest(`/training/subjects/${subject.id}`, { method: 'DELETE' })
-      setStatusMessage('Đã xóa môn học.')
+      showStatus('Đã xóa môn học.')
       if (editingSubjectId === subject.id) {
         setEditingSubjectId(null)
         setSubjectForm({ code: '', name: '', session_count: '0', weight: '1', description: '', learning_outcomes: '' })
@@ -1434,7 +1533,7 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
       await loadSubjects()
       if (selectedProgramId) await loadProgramSubjects(selectedProgramId)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể xóa môn học.')
+      showStatus(error instanceof Error ? error.message : 'Không thể xóa môn học.', 'error')
     }
   }
 
@@ -1450,11 +1549,11 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
     try {
       await apiRequest(`/training/programs/${selectedProgramId}/subjects`, { method: 'POST', body: JSON.stringify(payload) })
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể gán môn học vào chương trình.')
+      showStatus(error instanceof Error ? error.message : 'Không thể gán môn học vào chương trình.', 'error')
       return
     }
     setProgramLinkForm({ subject_id: '', sequence_order: '1', prerequisite_subject_id: '', is_required: 'true' })
-    setStatusMessage('Đã gán môn học vào chương trình.')
+    showStatus('Đã gán môn học vào chương trình.')
     void loadProgramSubjects(selectedProgramId)
   }
 
@@ -1463,9 +1562,9 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
     try {
       await apiRequest(`/training/programs/${selectedProgramId}/subjects/${item.id}`, { method: 'DELETE' })
       await loadProgramSubjects(selectedProgramId)
-      setStatusMessage(`Đã gỡ ${item.name} khỏi chương trình.`)
+      showStatus(`Đã gỡ ${item.name} khỏi chương trình.`)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể gỡ môn học.')
+      showStatus(error instanceof Error ? error.message : 'Không thể gỡ môn học.', 'error')
     }
   }
 
@@ -1477,9 +1576,9 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         body: JSON.stringify({ association_ids: orderedItems.map((item) => item.id) }),
       })
       await loadProgramSubjects(selectedProgramId)
-      setStatusMessage('Đã lưu thứ tự môn học.')
+      showStatus('Đã lưu thứ tự môn học.')
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu thứ tự môn học.')
+      showStatus(error instanceof Error ? error.message : 'Không thể lưu thứ tự môn học.', 'error')
     }
   }
 
@@ -1493,9 +1592,9 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
       })
       setClassName('')
       await loadTrainingClasses(selectedProgramId)
-      setStatusMessage('Đã tạo lớp ở trạng thái chuẩn bị.')
+      showStatus('Đã tạo lớp ở trạng thái chuẩn bị.')
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể tạo lớp.')
+      showStatus(error instanceof Error ? error.message : 'Không thể tạo lớp.', 'error')
     }
   }
 
@@ -1506,9 +1605,9 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         body: JSON.stringify({ status }),
       })
       if (selectedProgramId) await loadTrainingClasses(selectedProgramId)
-      setStatusMessage('Đã cập nhật trạng thái lớp.')
+      showStatus('Đã cập nhật trạng thái lớp.')
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể cập nhật trạng thái lớp.')
+      showStatus(error instanceof Error ? error.message : 'Không thể cập nhật trạng thái lớp.', 'error')
     }
   }
 
@@ -1525,11 +1624,11 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         }),
       })
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể lưu buổi học.')
+      showStatus(error instanceof Error ? error.message : 'Không thể lưu buổi học.', 'error')
       return
     }
     setSessionForm({ sequence: String(subjectSessions.length + 2), title: '', objectives: '' })
-    setStatusMessage('Đã lưu buổi học.')
+    showStatus('Đã lưu buổi học.')
     void loadSubjectSessions(selectedSubjectId)
   }
 
@@ -1543,14 +1642,16 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
       })
       await loadSubjectSessions(selectedSubjectId)
       setCloneSourceSubjectId('')
-      setStatusMessage(`Đã sao chép ${result.copied_count} buổi học vào môn đích.`)
+      showStatus(`Đã sao chép ${result.copied_count} buổi học vào môn đích.`)
     } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : 'Không thể sao chép buổi học.')
+      showStatus(error instanceof Error ? error.message : 'Không thể sao chép buổi học.', 'error')
     }
   }
 
   async function submitLead(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
+    setLeadError('')
+    setDuplicateWarning('')
     const payload = {
       full_name: leadForm.full_name,
       phone: leadForm.phone,
@@ -1561,14 +1662,108 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
       website: '',
     }
     try {
-      await apiRequest('/leads', { method: 'POST', body: JSON.stringify(payload) })
+      await apiRequest(editingLeadId ? `/leads/${editingLeadId}` : '/leads', {
+        method: editingLeadId ? 'PATCH' : 'POST',
+        body: JSON.stringify(payload),
+      })
     } catch (error) {
       setLeadError(error instanceof Error ? error.message : 'Không thể gửi đăng ký tư vấn.')
       return
     }
     setLeadForm({ full_name: '', phone: '', email: '', source: 'website', program_interest: '', notes: '' })
-    setStatusMessage('Đã tạo lead và ghi nhận thông tin tư vấn.')
-    void loadLeads().catch((error: Error) => setLeadError(error.message))
+    setEditingLeadId(null)
+    showStatus(editingLeadId ? 'Đã cập nhật lead.' : 'Đã tạo lead và ghi nhận thông tin tư vấn.')
+    await loadLeads().catch((error: Error) => setLeadError(error.message))
+  }
+
+  async function checkLeadDuplicate(phone: string, excludeId?: number) {
+    if (!phone.trim()) {
+      setDuplicateWarning('')
+      return
+    }
+    const params = new URLSearchParams({ phone })
+    if (excludeId) params.set('exclude_id', String(excludeId))
+    try {
+      const result = await apiRequest<{ duplicate: boolean }>(`/leads/duplicate-check?${params.toString()}`, { method: 'GET' })
+      setDuplicateWarning(result.duplicate ? 'Số điện thoại này đã tồn tại trong danh sách lead.' : '')
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể kiểm tra số điện thoại trùng.')
+    }
+  }
+
+  async function editLead(lead: LeadRecord) {
+    setEditingLeadId(lead.id)
+    setLeadForm({
+      full_name: lead.full_name,
+      phone: lead.phone,
+      email: lead.email ?? '',
+      source: lead.source,
+      program_interest: lead.program_interest ?? '',
+      notes: lead.notes ?? '',
+    })
+    setDuplicateWarning('')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  async function removeLead(lead: LeadRecord) {
+    if (!window.confirm(`Xóa lead của ${lead.full_name}? Thao tác này không thể hoàn tác.`)) return
+    try {
+      await apiRequest(`/leads/${lead.id}`, { method: 'DELETE' })
+      showStatus('Đã xóa lead.')
+      await loadLeads()
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể xóa lead.')
+    }
+  }
+
+  async function assignSelectedLeads(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (selectedLeadIds.length === 0) return
+    try {
+      await apiRequest<{ assigned_count: number }>('/leads/assign-bulk', {
+        method: 'POST',
+        body: JSON.stringify({
+          lead_ids: selectedLeadIds,
+          assigned_to_user_id: bulkAssigneeId || null,
+        }),
+      })
+      setSelectedLeadIds([])
+      showStatus('Đã phân công các lead đã chọn.')
+      await loadLeads()
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể phân công lead hàng loạt.')
+    }
+  }
+
+  async function toggleLeadHistory(leadId: number) {
+    if (expandedLeadId === leadId) {
+      setExpandedLeadId(null)
+      setLeadInteractions([])
+      return
+    }
+    try {
+      const history = await apiRequest<LeadInteraction[]>(`/leads/${leadId}/interactions`, { method: 'GET' })
+      setLeadInteractions(history)
+      setInteractionNote('')
+      setExpandedLeadId(leadId)
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể tải lịch sử trao đổi.')
+    }
+  }
+
+  async function addLeadInteraction(event: FormEvent<HTMLFormElement>, leadId: number) {
+    event.preventDefault()
+    try {
+      await apiRequest(`/leads/${leadId}/interactions`, {
+        method: 'POST',
+        body: JSON.stringify({ note: interactionNote }),
+      })
+      setInteractionNote('')
+      const history = await apiRequest<LeadInteraction[]>(`/leads/${leadId}/interactions`, { method: 'GET' })
+      setLeadInteractions(history)
+    } catch (error) {
+      setLeadError(error instanceof Error ? error.message : 'Không thể lưu ghi chú trao đổi.')
+    }
   }
 
   async function updateLead(leadId: number, status: string) {
@@ -1601,7 +1796,7 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         <p className="eyebrow blue">CHƯƠNG TRÌNH ĐÀO TẠO</p>
         <h1>{moduleLabels[module]}</h1>
         <p>Bạn được cấp quyền <strong>{permissionLabel(permission)}</strong> cho chức năng này.</p>
-        {statusMessage && <div className="form-success" role="status">{statusMessage}</div>}
+        {statusMessage && <TransientMessage key={`${statusVersion}-${statusTone}-${statusMessage}`} message={statusMessage} tone={statusTone} />}
         {permission === 'F' && <div className="two-column-grid">
           <form className="card-panel" onSubmit={saveProgram}>
             <h3>{editingProgramId ? 'Cập nhật chương trình' : 'Thêm chương trình'}</h3>
@@ -1774,19 +1969,32 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
         <p className="eyebrow blue">ĐẦU PHỄU TUYỂN SINH</p>
         <h1>{moduleLabels[module]}</h1>
         <p>Bạn được cấp quyền <strong>{permissionLabel(permission)}</strong> cho chức năng này.</p>
-        {leadError && <div className="form-error" role="alert">{leadError}</div>}
-        {statusMessage && <div className="form-success" role="status">{statusMessage}</div>}
+        {leadError && (
+          <div className="form-error lead-error-banner" role="alert">
+            <span>{leadError}</span>
+            {leadError.includes('Không thể kết nối') && (
+              <button className="secondary-button" type="button" onClick={() => void retryLeadConnection()} disabled={retryingLeadConnection}>
+                {retryingLeadConnection ? 'Đang kết nối...' : 'Thử kết nối lại'}
+              </button>
+            )}
+          </div>
+        )}
+        {statusMessage && <TransientMessage key={`${statusVersion}-${statusTone}-${statusMessage}`} message={statusMessage} tone={statusTone} />}
         {permission === 'F' && <p><a href="/register" target="_blank" rel="noreferrer">Mở form đăng ký tư vấn công khai ↗</a></p>}
         <div className="two-column-grid lead-workspace-grid">
-          {permission === 'F' && <form className="card-panel lead-create-form" onSubmit={submitLead}>
-            <h3>Đăng ký tư vấn</h3>
-            <label>Họ tên<input value={leadForm.full_name} onChange={(event) => setLeadForm({ ...leadForm, full_name: event.target.value })} /></label>
-            <label>Số điện thoại<input value={leadForm.phone} onChange={(event) => setLeadForm({ ...leadForm, phone: event.target.value })} /></label>
-            <label>Email<input type="email" value={leadForm.email} onChange={(event) => setLeadForm({ ...leadForm, email: event.target.value })} /></label>
-            <label>Chương trình quan tâm<input value={leadForm.program_interest} onChange={(event) => setLeadForm({ ...leadForm, program_interest: event.target.value })} /></label>
+          {(permission === 'F' || permission === 'W') && <form className="card-panel lead-create-form" onSubmit={submitLead}>
+            <h3>{editingLeadId ? 'Chỉnh sửa lead' : 'Tạo lead'}</h3>
+            <label>Họ tên<input value={leadForm.full_name} onChange={(event) => setLeadForm({ ...leadForm, full_name: event.target.value })} placeholder="Ví dụ: Nguyễn Văn An" /></label>
+            <label>Số điện thoại<input value={leadForm.phone} onChange={(event) => { setLeadForm({ ...leadForm, phone: event.target.value }); setDuplicateWarning('') }} onBlur={() => void checkLeadDuplicate(leadForm.phone, editingLeadId ?? undefined)} placeholder="Ví dụ: 0912345678" /></label>
+            {duplicateWarning && <div className="form-error" role="alert">{duplicateWarning}</div>}
+            <label>Email<input type="email" value={leadForm.email} onChange={(event) => setLeadForm({ ...leadForm, email: event.target.value })} placeholder="Ví dụ: an@example.com (không bắt buộc)" /></label>
+            <label>Chương trình quan tâm<input value={leadForm.program_interest} onChange={(event) => setLeadForm({ ...leadForm, program_interest: event.target.value })} placeholder="Khóa học muốn tìm hiểu, ví dụ: Lập trình Web" /><small className="field-hint">Ghi tên khóa học/lĩnh vực khách muốn tư vấn; chưa rõ thì có thể để trống.</small></label>
             <label>Nguồn<select value={leadForm.source} onChange={(event) => setLeadForm({ ...leadForm, source: event.target.value })}><option value="website">Website</option><option value="facebook">Facebook</option><option value="walkin">Tự đến</option><option value="referral">Giới thiệu</option></select></label>
-            <label>Ghi chú<textarea value={leadForm.notes} onChange={(event) => setLeadForm({ ...leadForm, notes: event.target.value })} /></label>
-            <button className="primary-button" type="submit">Gửi thông tin</button>
+            <label>Ghi chú<textarea value={leadForm.notes} onChange={(event) => setLeadForm({ ...leadForm, notes: event.target.value })} placeholder="Ví dụ: Thời gian thuận tiện để liên hệ hoặc nội dung cần tư vấn." /></label>
+            <div className="inline-row">
+              <button className="primary-button" type="submit">{editingLeadId ? 'Lưu chỉnh sửa' : 'Tạo lead'}</button>
+              {editingLeadId && <button className="secondary-button" type="button" onClick={() => { setEditingLeadId(null); setLeadForm({ full_name: '', phone: '', email: '', source: 'website', program_interest: '', notes: '' }); setDuplicateWarning('') }}>Hủy sửa</button>}
+            </div>
           </form>}
 
           <div className="card-panel lead-list-panel">
@@ -1797,12 +2005,23 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
                 <label>Trạng thái<select value={leadFilters.status} onChange={(event) => setLeadFilters({ ...leadFilters, status: event.target.value })}><option value="">Tất cả</option><option value="new">Mới</option><option value="assigned">Đã phân công</option><option value="contacted">Đã liên hệ</option><option value="qualified">Tiềm năng</option><option value="converted">Đã đăng ký</option><option value="lost">Không tiếp tục</option></select></label>
                 <label>Nguồn<select value={leadFilters.source} onChange={(event) => setLeadFilters({ ...leadFilters, source: event.target.value })}><option value="">Tất cả</option><option value="website">Website</option><option value="facebook">Facebook</option><option value="walkin">Tự đến</option><option value="referral">Giới thiệu</option></select></label>
               </div>
+              {permission === 'F' && <label>Người phụ trách<select value={leadFilters.assigned_to} onChange={(event) => setLeadFilters({ ...leadFilters, assigned_to: event.target.value })}><option value="">Tất cả người phụ trách</option>{leadAssignees.map((assignee) => <option key={assignee.id} value={String(assignee.id)}>{assignee.full_name}</option>)}</select></label>}
+              <div className="inline-row">
+                <label>Từ ngày<input type="date" value={leadFilters.from_date} onChange={(event) => setLeadFilters({ ...leadFilters, from_date: event.target.value })} /></label>
+                <label>Đến ngày<input type="date" value={leadFilters.to_date} onChange={(event) => setLeadFilters({ ...leadFilters, to_date: event.target.value })} /></label>
+              </div>
               <button className="secondary-button" type="submit">Lọc danh sách</button>
             </form>
+            {permission === 'F' && <form className="inline-row lead-bulk-assign" onSubmit={(event) => void assignSelectedLeads(event)}>
+              <span>{selectedLeadIds.length} lead đã chọn</span>
+              <label>Phân công cho<select value={bulkAssigneeId} onChange={(event) => setBulkAssigneeId(event.target.value)} required><option value="">-- Chọn tư vấn viên --</option>{leadAssignees.map((assignee) => <option key={assignee.id} value={String(assignee.id)}>{assignee.full_name}</option>)}</select></label>
+              <button className="secondary-button" type="submit" disabled={selectedLeadIds.length === 0}>Phân công hàng loạt</button>
+            </form>}
             {leads.length === 0 ? <p className="muted">Chưa có lead nào.</p> : (
               <div className="list-stack">
                 {leads.map((lead) => (
                   <div key={lead.id} className="list-item compact">
+                    {permission === 'F' && <label className="lead-select-checkbox"><input type="checkbox" checked={selectedLeadIds.includes(lead.id)} onChange={(event) => setSelectedLeadIds((current) => event.target.checked ? [...current, lead.id] : current.filter((id) => id !== lead.id))} />Chọn để phân công</label>}
                     <strong>{lead.full_name}</strong>
                     <small>
                       {lead.phone}{lead.email ? ` · ${lead.email}` : ''} · {
@@ -1817,9 +2036,17 @@ function ModuleLanding({ module, permission }: { module: ModuleId; permission: '
                                 lead.status === 'converted' ? 'Đã đăng ký' : 'Không tiếp tục'
                       }{lead.assigned_to_name ? ` · Phụ trách: ${lead.assigned_to_name}` : ''}
                     </small>
-                    {permission === 'F' && <div className="inline-row lead-actions">
+                    {(permission === 'F' || permission === 'W') && <div className="inline-row lead-actions">
                       <label>Trạng thái<select value={lead.status} onChange={(event) => void updateLead(lead.id, event.target.value)}><option value="new">Mới</option><option value="assigned">Đã phân công</option><option value="contacted">Đã liên hệ</option><option value="qualified">Tiềm năng</option><option value="converted">Đã đăng ký</option><option value="lost">Không tiếp tục</option></select></label>
-                      <label>Người phụ trách<select value={lead.assigned_to_user_id ? String(lead.assigned_to_user_id) : ''} onChange={(event) => void assignLead(lead.id, event.target.value)}><option value="">Chưa phân công</option>{leadAssignees.map((assignee) => <option key={assignee.id} value={String(assignee.id)}>{assignee.full_name}</option>)}</select></label>
+                      {permission === 'F' && <label>Người phụ trách<select value={lead.assigned_to_user_id ? String(lead.assigned_to_user_id) : ''} onChange={(event) => void assignLead(lead.id, event.target.value)}><option value="">Chưa phân công</option>{leadAssignees.map((assignee) => <option key={assignee.id} value={String(assignee.id)}>{assignee.full_name}</option>)}</select></label>}
+                      <button className="secondary-button" type="button" onClick={() => editLead(lead)}>Sửa lead</button>
+                      {canDeleteLeads && <button className="secondary-button" type="button" onClick={() => void removeLead(lead)}>Xóa lead</button>}
+                      <button className="secondary-button" type="button" onClick={() => void toggleLeadHistory(lead.id)}>{expandedLeadId === lead.id ? 'Ẩn lịch sử' : 'Lịch sử trao đổi'}</button>
+                    </div>}
+                    {expandedLeadId === lead.id && <div className="lead-history">
+                      <h4>Lịch sử trao đổi</h4>
+                      {leadInteractions.length === 0 ? <p className="muted">Chưa có lịch sử.</p> : <div className="list-stack">{leadInteractions.map((item) => <div className="lead-history-item" key={item.id}><strong>{item.user_name}</strong><small>{new Date(item.created_at).toLocaleString('vi-VN')} · {item.action}</small><p>{item.note}</p></div>)}</div>}
+                      {(permission === 'F' || permission === 'W') && <form className="lead-history-form" onSubmit={(event) => void addLeadInteraction(event, lead.id)}><label>Ghi chú cuộc gọi / lần trao đổi<textarea value={interactionNote} onChange={(event) => setInteractionNote(event.target.value)} maxLength={2000} required /></label><button className="secondary-button" type="submit">Lưu vào lịch sử</button></form>}
                     </div>}
                   </div>
                 ))}
@@ -1853,24 +2080,45 @@ function Avatar({ name, avatarUrl }: { name: string; avatarUrl?: string | null }
   return <span className="avatar">{name.split(' ').map((part) => part[0]).slice(-2).join('').toUpperCase()}</span>
 }
 
-function ProfileModal({
+function formatDateOfBirth(date: string) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date)
+  return match ? `${match[3]}/${match[2]}/${match[1]}` : ''
+}
+
+function parseDateOfBirth(value: string) {
+  const trimmedValue = value.trim()
+  if (!trimmedValue) return ''
+
+  const match = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(trimmedValue)
+    ?? /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmedValue)
+  if (!match) return null
+
+  const dayFirst = match[0].includes('/')
+  const year = Number(dayFirst ? match[3] : match[1])
+  const month = Number(match[2])
+  const day = Number(dayFirst ? match[1] : match[3])
+  const daysInMonth = [
+    31,
+    year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28,
+    31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+  ][month - 1]
+  if (year < 1 || !daysInMonth || day < 1 || day > daysInMonth) return null
+
+  return `${year.toString().padStart(4, '0')}-${month.toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`
+}
+
+function ProfileView({
   user,
-  onClose,
   onUpdate,
   onUploadAvatar,
-  onChangePassword,
-  onLogout,
 }: {
   user: User
-  onClose: () => void
   onUpdate: (data: { full_name: string; phone: string; date_of_birth: string; address: string }) => Promise<void>
   onUploadAvatar: (file: File) => Promise<void>
-  onChangePassword: () => void
-  onLogout: () => void
 }) {
   const [fullName, setFullName] = useState(user.full_name)
   const [phone, setPhone] = useState(user.phone ?? '')
-  const [dateOfBirth, setDateOfBirth] = useState(user.date_of_birth ?? '')
+  const [dateOfBirth, setDateOfBirth] = useState(formatDateOfBirth(user.date_of_birth ?? ''))
   const [address, setAddress] = useState(user.address ?? '')
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
@@ -1882,7 +2130,12 @@ function ProfileModal({
     setSaving(true)
     setError('')
     try {
-      await onUpdate({ full_name: fullName, phone, date_of_birth: dateOfBirth, address })
+      const parsedDateOfBirth = parseDateOfBirth(dateOfBirth)
+      if (parsedDateOfBirth === null) {
+        setError('Ngày sinh không hợp lệ. Vui lòng nhập theo định dạng dd/mm/yyyy.')
+        return
+      }
+      await onUpdate({ full_name: fullName, phone, date_of_birth: parsedDateOfBirth, address })
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Không thể cập nhật hồ sơ.')
     } finally {
@@ -1906,7 +2159,7 @@ function ProfileModal({
   }
 
   return (
-    <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <div className="profile-page">
       {avatarPreviewOpen && user.avatar_url && (
         <div className="avatar-preview-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAvatarPreviewOpen(false) }}>
           <section className="avatar-preview" role="dialog" aria-modal="true" aria-label="Ảnh đại diện kích thước lớn">
@@ -1915,33 +2168,62 @@ function ProfileModal({
           </section>
         </div>
       )}
-      <section className="modal profile-modal" role="dialog" aria-modal="true" aria-labelledby="profile-modal-title">
-        <div className="modal-header">
-          <div><p className="eyebrow blue">THÔNG TIN CÁ NHÂN</p><h2 id="profile-modal-title">Tài khoản của tôi</h2></div>
-          <button className="close-button" onClick={onClose} aria-label="Đóng">×</button>
-        </div>
-        <div className="profile-summary">
-          {user.avatar_url ? (
-            <button className="profile-avatar-button" type="button" onClick={() => setAvatarPreviewOpen(true)} aria-label="Xem ảnh đại diện kích thước lớn">
-              <Avatar name={user.full_name} avatarUrl={user.avatar_url} />
-            </button>
-          ) : <Avatar name={user.full_name} />}
-          <div><strong>{user.full_name}</strong><span>{user.roles.map((role) => roleLabels[role]).join(', ')}</span></div>
-        </div>
+      <section aria-label="Thông tin tài khoản">
         {error && <div className="form-error" role="alert">{error}</div>}
-        <form className="stack profile-form-scroll" id="profile-form" onSubmit={saveProfile}>
-          <label>Ảnh đại diện<input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" onChange={(event) => void selectAvatar(event)} disabled={uploading} /></label>
-          <label>Họ và tên<input value={fullName} onChange={(event) => setFullName(event.target.value)} required minLength={2} /></label>
-          <label>Email<input value={user.email} disabled /></label>
-          <label>Số điện thoại<input value={phone} onChange={(event) => setPhone(event.target.value)} /></label>
-          <label>Ngày sinh<input type="date" value={dateOfBirth} onChange={(event) => setDateOfBirth(event.target.value)} /></label>
-          <label>Địa chỉ<textarea className="profile-address" value={address} onChange={(event) => setAddress(event.target.value)} maxLength={500} rows={3} placeholder="Nhập địa chỉ của bạn" /></label>
+        <form className="profile-form-scroll" id="profile-form" onSubmit={saveProfile}>
+          <div className="profile-sections">
+            <section className="profile-card">
+              <div className="profile-card-heading"><h3>Thông tin tài khoản</h3></div>
+              <div className="profile-card-body profile-account-fields">
+                <div className="profile-avatar-section">
+                  {user.avatar_url ? (
+                    <button className="profile-avatar-button" type="button" onClick={() => setAvatarPreviewOpen(true)} aria-label="Xem ảnh đại diện kích thước lớn">
+                      <Avatar name={user.full_name} avatarUrl={user.avatar_url} />
+                    </button>
+                  ) : <Avatar name={user.full_name} />}
+                  <label>Ảnh đại diện<input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" onChange={(event) => void selectAvatar(event)} disabled={uploading} /></label>
+                </div>
+                <div className="profile-readonly-field">
+                  <span>Email</span>
+                  <div className="profile-value">{user.email}</div>
+                </div>
+                <div className="profile-readonly-field">
+                  <span>Vai trò</span>
+                  <div className="profile-value">{user.roles.map((role) => roleLabels[role]).join(', ')}</div>
+                </div>
+              </div>
+            </section>
+            <section className="profile-card">
+              <div className="profile-card-heading"><h3>Thông tin người dùng</h3></div>
+              <div className="profile-card-body profile-user-fields">
+                <label>Họ và tên<input value={fullName} onChange={(event) => setFullName(event.target.value)} required minLength={2} /></label>
+                <label>Số điện thoại<input value={phone} onChange={(event) => setPhone(event.target.value)} /></label>
+                <label>Ngày sinh
+                  <div className="profile-date-input">
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      placeholder="dd/mm/yyyy"
+                      value={dateOfBirth}
+                      onChange={(event) => setDateOfBirth(event.target.value)}
+                      aria-label="Nhập ngày sinh theo định dạng ngày/tháng/năm"
+                    />
+                    <input
+                      type="date"
+                      value={parseDateOfBirth(dateOfBirth) ?? ''}
+                      onChange={(event) => setDateOfBirth(formatDateOfBirth(event.target.value))}
+                      aria-label="Chọn ngày sinh trên lịch"
+                    />
+                  </div>
+                </label>
+                <label>Địa chỉ<textarea className="profile-address" value={address} onChange={(event) => setAddress(event.target.value)} maxLength={500} rows={3} placeholder="Nhập địa chỉ của bạn" /></label>
+              </div>
+            </section>
+          </div>
+          <div className="profile-page-actions">
+            <button className="primary-button" type="submit" disabled={saving}>{saving ? 'Đang lưu...' : 'Lưu hồ sơ'}</button>
+          </div>
         </form>
-        <div className="profile-modal-actions">
-          <button className="primary-button" type="submit" form="profile-form" disabled={saving}>{saving ? 'Đang lưu...' : 'Lưu hồ sơ'}</button>
-          <button className="secondary-button" onClick={onChangePassword}>Đổi mật khẩu</button>
-          <button className="danger-button" onClick={onLogout}>Đăng xuất</button>
-        </div>
       </section>
     </div>
   )
@@ -1970,7 +2252,7 @@ function UsersView({
   onDelete: (user: User) => Promise<void>
   onStatus: (user: User, active: boolean, reason: string) => Promise<void>
   onImport: (file: File) => Promise<{ imported: number; skipped: number; errors: string[] }>
-  onPreviewImport: (file: File) => Promise<{ valid: number; skipped: number; errors: string[] }>
+  onPreviewImport: (file: File) => Promise<ImportPreview>
 }) {
   const initialFilters = readUserFilters(ownerId)
   const [query, setQuery] = useState(initialFilters.q)
@@ -1979,9 +2261,10 @@ function UsersView({
   const [searching, setSearching] = useState(false)
   const [searchError, setSearchError] = useState('')
   const [importFile, setImportFile] = useState<File | null>(null)
+  const [importDragging, setImportDragging] = useState(false)
   const importInput = useRef<HTMLInputElement>(null)
   const [importResult, setImportResult] = useState<{ imported: number; skipped: number; errors: string[] } | null>(null)
-  const [importPreview, setImportPreview] = useState<{ valid: number; skipped: number; errors: string[] } | null>(null)
+  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null)
   const [importError, setImportError] = useState('')
   const [importing, setImporting] = useState(false)
   const [previewing, setPreviewing] = useState(false)
@@ -1996,6 +2279,28 @@ function UsersView({
   const editing = users.find((item) => item.id === editingId) ?? null
   const locking = users.find((item) => item.id === lockingId) ?? null
   const pageCount = Math.max(1, Math.ceil(page.total / page.page_size))
+  const importHasValidationErrors = Boolean(importError)
+    || Boolean(importPreview && (importPreview.valid === 0 || importPreview.skipped > 0))
+
+  function selectImportFile(file: File | null) {
+    setImportFile(file)
+    setImportPreview(null)
+    setImportResult(null)
+    setImportError('')
+    if (file && !file.name.toLowerCase().endsWith('.xlsx')) {
+      setImportError('Vui lòng chọn tệp Excel có định dạng .xlsx.')
+      if (importInput.current) importInput.current.value = ''
+      return
+    }
+    if (!file && importInput.current) importInput.current.value = ''
+  }
+
+  function dropImportFile(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault()
+    setImportDragging(false)
+    selectImportFile(event.dataTransfer.files[0] ?? null)
+    if (importInput.current) importInput.current.value = ''
+  }
 
   async function runQuery(filters: UserFilters) {
     if (searching) return
@@ -2019,6 +2324,7 @@ function UsersView({
     try {
       setImportResult(await onImport(importFile))
       setImportFile(null)
+      setImportPreview(null)
       if (importInput.current) importInput.current.value = ''
     } catch (error) {
       setImportError(error instanceof Error ? error.message : 'Không thể nhập danh sách người dùng.')
@@ -2091,16 +2397,112 @@ function UsersView({
             <div><h2>Nhập tài khoản từ Excel</h2><p className="muted">Cột bắt buộc: full_name, email, roles. Nhiều vai trò phân tách bằng dấu phẩy; nếu chưa cấu hình email, cần nhập initial_password tối thiểu 8 ký tự.</p></div>
             <button className="secondary-button" type="button" onClick={() => void downloadTemplate()}>Tải file mẫu</button>
           </div>
-          <form className="inline-row" onSubmit={(event) => void submitImport(event)}>
-            <label>Chọn file .xlsx<input ref={importInput} type="file" accept=".xlsx" onChange={(event) => { setImportFile(event.target.files?.[0] ?? null); setImportPreview(null); setImportResult(null) }} /></label>
-            <button className="secondary-button" type="button" onClick={() => void previewImport()} disabled={!importFile || previewing || importing}>{previewing ? 'Đang kiểm tra...' : 'Kiểm tra dữ liệu'}</button>
-            <button className="primary-button" type="submit" disabled={!importPreview || importPreview.valid === 0 || importing}>{importing ? 'Đang nhập...' : `Nhập ${importPreview?.valid ?? ''} dòng hợp lệ`}</button>
+          <form className="import-form" onSubmit={(event) => void submitImport(event)}>
+            <div
+              className={`import-dropzone${importDragging ? ' is-dragging' : ''}${importFile ? ' has-file' : ''}${importFile && !importHasValidationErrors ? ' is-valid' : ''}${importHasValidationErrors ? ' is-invalid' : ''}`}
+              onDragEnter={(event) => { event.preventDefault(); setImportDragging(true) }}
+              onDragOver={(event) => event.preventDefault()}
+              onDragLeave={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setImportDragging(false)
+              }}
+              onDrop={dropImportFile}
+              onClick={() => importInput.current?.click()}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault()
+                  importInput.current?.click()
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              aria-label="Chọn hoặc kéo thả file Excel .xlsx"
+            >
+              <input
+                ref={importInput}
+                className="import-file-input"
+                type="file"
+                accept=".xlsx"
+                aria-label="Chọn file Excel"
+                onClick={(event) => event.stopPropagation()}
+                onChange={(event) => selectImportFile(event.target.files?.[0] ?? null)}
+              />
+              <span className="import-file-icon" aria-hidden="true">{importFile ? '✓' : '⇧'}</span>
+              <span className="import-dropzone-copy">
+                <strong>{importFile ? importFile.name : 'Kéo thả file Excel vào đây'}</strong>
+                <span>{importFile ? `${(importFile.size / 1024).toFixed(1)} KB · Excel .xlsx` : 'hoặc bấm để chọn file .xlsx từ thiết bị'}</span>
+              </span>
+              {importFile && (
+                <button
+                  className="import-remove-file"
+                  type="button"
+                  aria-label="Bỏ file đã chọn"
+                  onClick={(event) => { event.stopPropagation(); selectImportFile(null) }}
+                >
+                  ×
+                </button>
+              )}
+            </div>
+            <div className="import-actions">
+              <button
+                className={`secondary-button import-check-button${importFile ? ' is-ready' : ''}${importPreview ? ' is-checked' : ''}${importHasValidationErrors ? ' is-invalid' : ''}`}
+                type="button"
+                onClick={() => void previewImport()}
+                disabled={!importFile || !importFile.name.toLowerCase().endsWith('.xlsx') || previewing || importing}
+              >
+                {previewing
+                  ? 'Đang kiểm tra...'
+                  : importPreview && importHasValidationErrors
+                    ? 'Đã kiểm tra · Có lỗi'
+                    : importPreview
+                      ? '✓ Đã kiểm tra dữ liệu'
+                      : 'Kiểm tra dữ liệu'}
+              </button>
+              <button className="primary-button" type="submit" disabled={!importPreview || importPreview.valid === 0 || importing}>
+                {importing ? 'Đang nhập...' : `Nhập ${importPreview?.valid ?? ''} dòng hợp lệ`}
+              </button>
+            </div>
           </form>
           {importError && <div className="form-error" role="alert">{importError}</div>}
-          {importPreview && <div className="form-success" role="status">
-            Kiểm tra xong: {importPreview.valid} dòng hợp lệ, {importPreview.skipped} dòng sẽ bị bỏ qua.
-            {importPreview.errors.length > 0 && <ul>{importPreview.errors.map((item) => <li key={item}>{item}</li>)}</ul>}
-          </div>}
+          {importPreview && (
+            <div className={`import-preview${importPreview.valid > 0 ? ' has-valid-rows' : ' has-no-valid-rows'}`} role="status" aria-live="polite">
+              <div className="import-preview-summary">
+                <span className="import-summary-icon" aria-hidden="true">{importPreview.valid > 0 ? '✓' : '!'}</span>
+                <div>
+                  <strong>{importPreview.valid > 0 ? 'Kiểm tra dữ liệu hoàn tất' : 'Không có dòng hợp lệ để nhập'}</strong>
+                  <p>{importPreview.valid} dòng hợp lệ <span>·</span> {importPreview.skipped} dòng cần bỏ qua</p>
+                </div>
+              </div>
+              {importPreview.preview_rows.length > 0 && (
+                <div className="import-table-wrap">
+                  <div className="import-table-heading">
+                    <strong>Xem trước dữ liệu</strong>
+                    <span>{Math.min(importPreview.preview_rows.length, 20)} / {importPreview.valid} dòng đầu tiên</span>
+                  </div>
+                  <table className="import-preview-table">
+                    <thead><tr><th>Dòng</th><th>Họ và tên</th><th>Email</th><th>Vai trò</th><th>Điện thoại</th><th>Lớp</th></tr></thead>
+                    <tbody>
+                      {importPreview.preview_rows.map((row) => (
+                        <tr key={`${row.row_number}-${row.email}`}>
+                          <td>{row.row_number}</td>
+                          <td>{row.full_name}</td>
+                          <td>{row.email}</td>
+                          <td>{row.roles.map((role) => roleOptions.find(([value]) => value === role)?.[1] ?? role).join(', ')}</td>
+                          <td>{row.phone || '—'}</td>
+                          <td>{row.assigned_classes.join(', ') || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {importPreview.errors.length > 0 && (
+                <details className="import-validation-errors">
+                  <summary>Xem {importPreview.errors.length} dòng có lỗi</summary>
+                  <ul>{importPreview.errors.map((item) => <li key={item}>{item}</li>)}</ul>
+                </details>
+              )}
+            </div>
+          )}
           {importResult && (
             <div className="form-success" role="status">
               Đã nhập {importResult.imported} tài khoản; bỏ qua {importResult.skipped} dòng lỗi.
