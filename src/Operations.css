@@ -117,9 +117,23 @@
 .timeline-item.overdue .timeline-dot { background: #e2555d; box-shadow: 0 0 0 1px #f5c4c6; }
 .timeline-item.overdue em { color: #bc4147; font-weight: 700; }
 .ops-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 20px; background: #09192d78; backdrop-filter: blur(3px); }
-.ops-dialog { width: min(100%, 780px); max-height: min(90dvh, 900px); overflow: auto; padding: 22px; border: 1px solid #e6ebf1; border-radius: 15px; background: #fff; box-shadow: 0 25px 80px #07172c40; }
-.ops-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 18px; }
-.ops-dialog > header h2 { margin: 0; color: #1c2e45; font: 800 19px 'Manrope', sans-serif; }
+.ops-dialog {
+  width: min(96vw, 1140px);
+  max-height: min(92dvh, 920px);
+  overflow: auto;
+  padding: 26px 30px;
+  border: 1px solid #e6ebf1;
+  border-radius: 16px;
+  background: #fff;
+  box-shadow: 0 25px 80px #07172c40;
+}
+.ops-dialog.ops-dialog-wide {
+  width: min(98vw, 1320px);
+  max-height: min(94dvh, 940px);
+  padding: 26px 32px;
+}
+.ops-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 20px; }
+.ops-dialog > header h2 { margin: 0; color: #1c2e45; font: 800 22px 'Manrope', sans-serif; letter-spacing: -0.02em; }
 .ops-dialog > header button { width: 34px; height: 34px; border: 0; border-radius: 8px; color: #68778c; background: #f2f5f8; font-size: 22px; cursor: pointer; }
 .ops-dialog-section + .ops-form, .ops-form + .ops-form { margin-top: 22px; padding-top: 17px; border-top: 1px solid #edf0f4; }
 .ops-form { display: grid; gap: 14px; }
@@ -130,9 +144,38 @@
 .ops-field textarea { min-height: 74px; padding: 10px; resize: vertical; }
 .ops-field select[multiple] { min-height: 90px; }
 .ops-dialog-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 15px; }
-.ops-progress { min-width: 100px; color: #6e7d91; font-size: 10px; }
-.ops-progress::before { display: block; width: 80px; height: 5px; margin-bottom: 5px; border-radius: 8px; background: #eef2f7; content: ''; }
-.ops-progress span { position: relative; top: 5px; display: block; max-width: 80px; height: 5px; margin-top: -10px; border-radius: 8px; background: #35a878; }
+.ops-progress-track {
+  position: relative;
+  width: 90px;
+  height: 20px;
+  background: #e2e8f0;
+  border-radius: 999px;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+.ops-progress-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, #3b82f6, #10b981);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+.ops-progress-text {
+  position: relative;
+  z-index: 2;
+  font-size: 11px;
+  font-weight: 800;
+  color: #0f172a;
+  text-shadow: 0 0 2px #fff, 0 0 4px #fff, 0 0 6px #fff;
+  line-height: 1;
+  pointer-events: none;
+}
+
 .ops-actions { display: flex; flex-wrap: wrap; gap: 5px; }
 .ops-actions button { min-height: 29px; padding: 0 7px; font-size: 10px; }
 .ops-actions button.danger { color: #bd454c; }
@@ -725,12 +768,12 @@
    ENHANCED LEAD PROFILE MODAL & PAGINATED TIMELINE (20 ROWS / PAGE)
    ========================================================================== */
 .ops-dialog.lead-detail-dialog {
-  width: min(96vw, 1180px);
-  max-height: min(94dvh, 920px);
-  padding: 22px 26px;
+  width: min(98vw, 1320px);
+  max-height: min(94dvh, 940px);
+  padding: 24px 30px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 16px;
 }
 
 .lead-detail-ribbon {

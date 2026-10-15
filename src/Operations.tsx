@@ -1485,6 +1485,7 @@ function StudentsOps({ request, notify, user, canEdit, canManage }: { request: A
   const [selected, setSelected] = useState<Student | null>(null)
   const [profile, setProfile] = useState<Student | null>(null)
   const [history, setHistory] = useState<StudentHistoryEntry[]>([])
+  const [historyPage, setHistoryPage] = useState(1)
   const [statusForm, setStatusForm] = useState({ action: 'defer', effective_date: today(), reason: '', target_class_id: '' })
   const [mySchedule, setMySchedule] = useState<TrainingSession[]>([])
   const [ownProfile, setOwnProfile] = useState<Student | null>(null)
@@ -1604,7 +1605,7 @@ function StudentsOps({ request, notify, user, canEdit, canManage }: { request: A
   }
 
   async function openProfile(row: Student) {
-    setSelected(row); setProfile(null); setHistory([])
+    setSelected(row); setProfile(null); setHistory([]); setHistoryPage(1)
     try {
       const value = await request<Student & { history?: unknown[]; activities?: unknown[] }>(`/students/${row.id}`)
       const normalized = normalizeStudent(value)
@@ -1901,7 +1902,7 @@ function StudentsOps({ request, notify, user, canEdit, canManage }: { request: A
       )}
 
       {selected && (
-        <Dialog title={`Hồ sơ học viên · ${profile?.full_name ?? selected.full_name}`} onClose={() => setSelected(null)}>
+        <Dialog title={`Hồ sơ học viên · ${profile?.full_name ?? selected.full_name}`} className="ops-dialog-wide" onClose={() => setSelected(null)}>
           {!profile ? (
             <StateBox loading error="" empty={false} />
           ) : (
@@ -1931,8 +1932,33 @@ function StudentsOps({ request, notify, user, canEdit, canManage }: { request: A
                 </form>
               )}
               <div className="ops-dialog-section">
-                <h3>Lịch sử hồ sơ</h3>
-                {history.length ? history.map((entry) => entry.type === 'class' ? (
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
+                  <h3 style={{ margin: 0 }}>Lịch sử hồ sơ ({history.length} bản ghi)</h3>
+                  {history.length > 5 && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12.5px' }}>
+                      <span style={{ color: '#64748b' }}>Trang {historyPage} / {Math.ceil(history.length / 5)}</span>
+                      <button
+                        type="button"
+                        className="ops-button"
+                        style={{ padding: '3px 8px', minHeight: '28px' }}
+                        disabled={historyPage <= 1}
+                        onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                      >
+                        ‹
+                      </button>
+                      <button
+                        type="button"
+                        className="ops-button"
+                        style={{ padding: '3px 8px', minHeight: '28px' }}
+                        disabled={historyPage >= Math.ceil(history.length / 5)}
+                        onClick={() => setHistoryPage((p) => Math.min(Math.ceil(history.length / 5), p + 1))}
+                      >
+                        ›
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {history.length ? history.slice((historyPage - 1) * 5, historyPage * 5).map((entry) => entry.type === 'class' ? (
                   <article className="history-row" key={`class-${entry.class_id}-${entry.enrolled_at}`}>
                     <strong>{entry.class_code ? `${entry.class_code} · ` : ''}{entry.class_name}</strong>
                     <StatusPill value={entry.status} />
@@ -2619,7 +2645,18 @@ function ClassesOps({ request, notify, canEdit }: { request: Api; notify: Props[
                     },
                     { name: 'Bắt đầu', render: (row) => row.start_date ? new Date(row.start_date).toLocaleDateString('vi-VN') : '—' },
                     { name: 'Quy mô', render: (row) => <>{row.enrolled_count ?? 0}{row.capacity ? ` / ${row.capacity} học viên` : ' học viên'}<small>{row.capacity ? `${Math.round(((row.enrolled_count ?? 0) / row.capacity) * 100)}% sức chứa` : ''}</small></> },
-                    { name: 'Tiến độ CTĐT', render: (row) => <div className="ops-progress"><span style={{ width: `${row.curriculum_progress ?? 0}%` }} />{row.curriculum_progress ?? 0}%</div> },
+                    {
+                      name: 'Tiến độ CTĐT',
+                      render: (row) => {
+                        const pct = Math.min(100, Math.max(0, row.curriculum_progress ?? 0))
+                        return (
+                          <div className="ops-progress-track" title={`Tiến độ hoàn thành: ${pct}%`}>
+                            <div className="ops-progress-fill" style={{ width: `${pct}%` }} />
+                            <span className="ops-progress-text">{pct}%</span>
+                          </div>
+                        )
+                      },
+                    },
                     { name: 'Tình trạng', render: (row) => <StatusPill value={row.status} /> },
                     {
                       name: 'Tác vụ',
@@ -2840,7 +2877,7 @@ function ClassesOps({ request, notify, canEdit }: { request: Api; notify: Props[
       )}
 
       {viewingClass && (
-        <Dialog title={`Chi tiết lớp học · ${viewingClass.name}`} onClose={() => setViewingClass(null)}>
+        <Dialog title={`Chi tiết lớp học · ${viewingClass.name}`} className="ops-dialog-wide" onClose={() => setViewingClass(null)}>
           <div style={{ padding: '8px 4px' }}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '14px', marginBottom: '20px' }}>
               <div style={{ background: '#f8fafc', padding: '12px 14px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>

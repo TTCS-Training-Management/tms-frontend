@@ -1785,6 +1785,7 @@ function ModuleLanding({ module, permission, canDeleteLeads }: { module: ModuleI
   const [duplicateWarning, setDuplicateWarning] = useState('')
   const [expandedLeadId, setExpandedLeadId] = useState<number | null>(null)
   const [leadInteractions, setLeadInteractions] = useState<LeadInteraction[]>([])
+  const [leadInteractionPage, setLeadInteractionPage] = useState(1)
   const [interactionNote, setInteractionNote] = useState('')
   const [leadError, setLeadError] = useState('')
   const [retryingLeadConnection, setRetryingLeadConnection] = useState(false)
@@ -2403,6 +2404,7 @@ function ModuleLanding({ module, permission, canDeleteLeads }: { module: ModuleI
     try {
       const history = await apiRequest<LeadInteraction[]>(`/leads/${leadId}/interactions`, { method: 'GET' })
       setLeadInteractions(history)
+      setLeadInteractionPage(1)
       setInteractionNote('')
       setExpandedLeadId(leadId)
     } catch (error) {
@@ -3277,8 +3279,43 @@ function ModuleLanding({ module, permission, canDeleteLeads }: { module: ModuleI
                           {canDeleteLeads && <button className="secondary-button" type="button" onClick={() => void removeLead(lead)}>Xóa lead</button>}
                         </div>}
                         <div className="lead-history">
-                          <h4>Lịch sử trao đổi</h4>
-                          {leadInteractions.length === 0 ? <p className="muted">Chưa có lịch sử.</p> : <div className="list-stack">{leadInteractions.map((item) => <div className="lead-history-item" key={item.id}><strong>{item.user_name}</strong><small>{formatLeadTimestamp(item.created_at)} · {item.action}</small><p>{item.note}</p></div>)}</div>}
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '8px' }}>
+                            <h4 style={{ margin: 0 }}>Lịch sử trao đổi ({leadInteractions.length} lần)</h4>
+                            {leadInteractions.length > 5 && (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px' }}>
+                                <span style={{ color: '#64748b' }}>Trang {leadInteractionPage} / {Math.ceil(leadInteractions.length / 5)}</span>
+                                <button
+                                  type="button"
+                                  className="secondary-button"
+                                  style={{ padding: '2px 8px', height: '26px', fontSize: '12px' }}
+                                  disabled={leadInteractionPage <= 1}
+                                  onClick={() => setLeadInteractionPage((p) => Math.max(1, p - 1))}
+                                >
+                                  ‹
+                                </button>
+                                <button
+                                  type="button"
+                                  className="secondary-button"
+                                  style={{ padding: '2px 8px', height: '26px', fontSize: '12px' }}
+                                  disabled={leadInteractionPage >= Math.ceil(leadInteractions.length / 5)}
+                                  onClick={() => setLeadInteractionPage((p) => Math.min(Math.ceil(leadInteractions.length / 5), p + 1))}
+                                >
+                                  ›
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                          {leadInteractions.length === 0 ? <p className="muted">Chưa có lịch sử.</p> : (
+                            <div className="list-stack">
+                              {leadInteractions.slice((leadInteractionPage - 1) * 5, leadInteractionPage * 5).map((item) => (
+                                <div className="lead-history-item" key={item.id}>
+                                  <strong>{item.user_name}</strong>
+                                  <small>{formatLeadTimestamp(item.created_at)} · {item.action}</small>
+                                  <p>{item.note}</p>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           {(permission === 'F' || permission === 'W') && <form className="lead-history-form" onSubmit={(event) => void addLeadInteraction(event, lead.id)}><label>Ghi chú cuộc gọi / lần trao đổi<textarea value={interactionNote} onChange={(event) => setInteractionNote(event.target.value)} maxLength={2000} required /></label><button className="secondary-button" type="submit">Lưu vào lịch sử</button></form>}
                         </div>
                       </div>}

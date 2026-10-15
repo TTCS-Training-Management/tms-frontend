@@ -14,6 +14,7 @@ export interface SearchableSelectProps {
   placeholder?: string
   disabled?: boolean
   className?: string
+  /** @deprecated Pagination is replaced by continuous scrolling as requested */
   pageSize?: number
   ariaLabel?: string
   id?: string
@@ -45,11 +46,14 @@ export function SearchableSelect({
   allowClear = true,
   style,
 }: SearchableSelectProps) {
+  const CHUNK_SIZE = Math.max(1, pageSize || 5)
   const [isOpen, setIsOpen] = useState(false)
   const [searchTerm, setSearchTerm] = useState('')
-  const [page, setPage] = useState(1)
+  const [highlightedIndex, setHighlightedIndex] = useState<number>(-1)
+  const [visibleCount, setVisibleCount] = useState<number>(CHUNK_SIZE)
   const containerRef = useRef<HTMLDivElement>(null)
   const searchInputRef = useRef<HTMLInputElement>(null)
+  const listRef = useRef<HTMLDivElement>(null)
 
   // Current selected option
   const selectedOption = useMemo(
@@ -69,30 +73,43 @@ export function SearchableSelect({
     })
   }, [options, searchTerm])
 
-  const totalPages = Math.max(1, Math.ceil(filteredOptions.length / pageSize))
-  const currentPage = Math.min(page, totalPages)
-
-  const visibleOptions = useMemo(() => {
-    const start = (currentPage - 1) * pageSize
-    return filteredOptions.slice(start, start + pageSize)
-  }, [filteredOptions, currentPage, pageSize])
-
-  // Reset page when search term changes
+  // Reset highlight & visible count on search change
   useEffect(() => {
-    setPage(1)
-  }, [searchTerm])
+    setHighlightedIndex(-1)
+    setVisibleCount(CHUNK_SIZE)
+  }, [searchTerm, CHUNK_SIZE])
 
-  // Focus search input when opening
+  // Focus search input and init visible count when opening
   useEffect(() => {
     if (isOpen) {
       setTimeout(() => {
         searchInputRef.current?.focus()
       }, 50)
+      // Highlight currently selected option if present and ensure it's in visible count
+      const curIdx = filteredOptions.findIndex((opt) => String(opt.value) === String(value))
+      if (curIdx >= 0) {
+        setVisibleCount(Math.max(CHUNK_SIZE, Math.ceil((curIdx + 1) / CHUNK_SIZE) * CHUNK_SIZE))
+        setHighlightedIndex(curIdx)
+      } else {
+        setVisibleCount(CHUNK_SIZE)
+        setHighlightedIndex(filteredOptions.length > 0 ? 0 : -1)
+      }
     } else {
       setSearchTerm('')
-      setPage(1)
+      setHighlightedIndex(-1)
+      setVisibleCount(CHUNK_SIZE)
     }
-  }, [isOpen])
+  }, [isOpen, value, filteredOptions, CHUNK_SIZE])
+
+  // Scroll highlighted item into view
+  useEffect(() => {
+    if (highlightedIndex >= 0 && listRef.current) {
+      const activeEl = listRef.current.children[highlightedIndex] as HTMLElement | undefined
+      if (activeEl) {
+        activeEl.scrollIntoView({ block: 'nearest' })
+      }
+    }
+  }, [highlightedIndex])
 
   // Click outside listener
   useEffect(() => {
@@ -119,11 +136,42 @@ export function SearchableSelect({
     setIsOpen(false)
   }
 
+  // Infinite scroll trigger: load next 5 items when approaching bottom
+  function handleListScroll(e: React.UIEvent<HTMLDivElement>) {
+    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget
+    if (scrollTop + clientHeight >= scrollHeight - 30) {
+      if (visibleCount < filteredOptions.length) {
+        setVisibleCount((prev) => Math.min(prev + CHUNK_SIZE, filteredOptions.length))
+      }
+    }
+  }
+
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
       setIsOpen(false)
-    } else if (e.key === 'ArrowDown' && !isOpen) {
-      setIsOpen(true)
+    } else if (e.key === 'ArrowDown') {
+      if (!isOpen) {
+        setIsOpen(true)
+      } else {
+        e.preventDefault()
+        setHighlightedIndex((prev) => {
+          const next = prev < filteredOptions.length - 1 ? prev + 1 : 0
+          if (next >= visibleCount && visibleCount < filteredOptions.length) {
+            setVisibleCount((cur) => Math.min(cur + CHUNK_SIZE, filteredOptions.length))
+          }
+          return next
+        })
+      }
+    } else if (e.key === 'ArrowUp') {
+      if (isOpen) {
+        e.preventDefault()
+        setHighlightedIndex((prev) => (prev > 0 ? prev - 1 : filteredOptions.length - 1))
+      }
+    } else if (e.key === 'Enter') {
+      if (isOpen && highlightedIndex >= 0 && highlightedIndex < filteredOptions.length) {
+        e.preventDefault()
+        handleSelect(filteredOptions[highlightedIndex].value)
+      }
     }
   }
 
@@ -207,65 +255,56 @@ export function SearchableSelect({
             )}
           </div>
 
-          <div className="searchable-select-list">
-            {visibleOptions.length === 0 ? (
+          <div className="searchable-select-list" ref={listRef} onScroll={handleListScroll}>
+            {filteredOptions.length === 0 ? (
               <div className="searchable-select-empty">
                 <span>Không tìm thấy kết quả phù hợp</span>
               </div>
             ) : (
-              visibleOptions.map((opt) => {
-                const isSelected = String(opt.value) === String(value)
-                return (
-                  <div
-                    key={String(opt.value)}
-                    role="option"
-                    aria-selected={isSelected}
-                    className={`searchable-select-option ${isSelected ? 'is-selected' : ''}`}
-                    onClick={() => handleSelect(opt.value)}
-                  >
-                    <div className="option-text-group">
-                      <span className="option-label">{opt.label}</span>
-                      {opt.subLabel && <span className="option-sublabel">{opt.subLabel}</span>}
+              <>
+                {filteredOptions.slice(0, visibleCount).map((opt, idx) => {
+                  const isSelected = String(opt.value) === String(value)
+                  const isHighlighted = idx === highlightedIndex
+                  return (
+                    <div
+                      key={String(opt.value)}
+                      role="option"
+                      aria-selected={isSelected}
+                      className={`searchable-select-option ${isSelected ? 'is-selected' : ''} ${isHighlighted ? 'is-highlighted' : ''}`}
+                      onClick={() => handleSelect(opt.value)}
+                      onMouseEnter={() => setHighlightedIndex(idx)}
+                    >
+                      <div className="option-text-group">
+                        <span className="option-label">{opt.label}</span>
+                        {opt.subLabel && <span className="option-sublabel">{opt.subLabel}</span>}
+                      </div>
+                      {opt.badge && <span className="option-badge">{opt.badge}</span>}
+                      {isSelected && <span className="option-check">✓</span>}
                     </div>
-                    {opt.badge && <span className="option-badge">{opt.badge}</span>}
-                    {isSelected && <span className="option-check">✓</span>}
+                  )
+                })}
+
+                {visibleCount < filteredOptions.length && (
+                  <div
+                    className="searchable-select-load-more"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      setVisibleCount((prev) => Math.min(prev + CHUNK_SIZE, filteredOptions.length))
+                    }}
+                    title="Cuộn chuột hoặc bấm để tải thêm"
+                  >
+                    <span>↓ Cuộn xuống để xem tiếp 5 lựa chọn (còn {filteredOptions.length - visibleCount})</span>
                   </div>
-                )
-              })
+                )}
+              </>
             )}
           </div>
 
-          {filteredOptions.length > pageSize && (
-            <div className="searchable-select-pagination">
-              <span className="pagination-info">
-                {filteredOptions.length} kết quả · Trang {currentPage}/{totalPages}
+          {filteredOptions.length > 0 && (
+            <div className="searchable-select-footer">
+              <span className="footer-count">
+                Đang hiện {Math.min(visibleCount, filteredOptions.length)} / {filteredOptions.length} lựa chọn{searchTerm ? ' phù hợp' : ''}
               </span>
-              <div className="pagination-buttons">
-                <button
-                  type="button"
-                  className="page-btn"
-                  disabled={currentPage <= 1}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    setPage((p) => Math.max(1, p - 1))
-                  }}
-                  title="5 mục trước"
-                >
-                  ‹
-                </button>
-                <button
-                  type="button"
-                  className="page-btn"
-                  disabled={currentPage >= totalPages}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    setPage((p) => Math.min(totalPages, p + 1))
-                  }}
-                  title="5 mục tiếp theo"
-                >
-                  ›
-                </button>
-              </div>
             </div>
           )}
         </div>

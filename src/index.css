@@ -47,6 +47,10 @@ button { cursor: pointer; }
   background: #fdfdfd;
 }
 
+.searchable-select-container.is-open {
+  z-index: 1000;
+}
+
 .searchable-select-container.is-open .searchable-select-trigger {
   border-color: #4f46e5;
   box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.12);
@@ -209,9 +213,29 @@ button { cursor: pointer; }
 }
 
 .searchable-select-list {
-  max-height: 205px; /* Tầm 5 mục */
+  max-height: 220px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 4px 0;
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+.searchable-select-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.searchable-select-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.searchable-select-list::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 9999px;
+}
+
+.searchable-select-list::-webkit-scrollbar-thumb:hover {
+  background-color: #94a3b8;
 }
 
 .searchable-select-empty {
@@ -233,7 +257,8 @@ button { cursor: pointer; }
   color: #1e293b;
 }
 
-.searchable-select-option:hover {
+.searchable-select-option:hover,
+.searchable-select-option.is-highlighted {
   background: #f1f5f9;
 }
 
@@ -277,46 +302,36 @@ button { cursor: pointer; }
   font-weight: 700;
 }
 
-.searchable-select-pagination {
-  padding: 6px 10px;
+.searchable-select-footer {
+  padding: 6px 12px;
   background: #f8fafc;
   border-top: 1px solid #e2e8f0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   font-size: 11.5px;
   color: #64748b;
+  user-select: none;
 }
 
-.pagination-buttons {
+.searchable-select-load-more {
+  padding: 8px 12px;
+  font-size: 12px;
+  text-align: center;
+  color: #4f46e5;
+  background: #f8fafc;
+  border-top: 1px dashed #cbd5e1;
+  cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 4px;
-}
-
-.pagination-buttons .page-btn {
-  display: inline-flex;
-  align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
-  border: 1px solid #cbd5e1;
-  border-radius: 4px;
-  background: #ffffff;
-  color: #1e293b;
-  font-size: 13px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: all 0.1s ease;
+  gap: 6px;
+  font-weight: 600;
+  transition: all 0.15s ease;
 }
 
-.pagination-buttons .page-btn:hover:not(:disabled) {
-  background: #e0e7ff;
-  border-color: #4f46e5;
-  color: #4338ca;
+.searchable-select-load-more:hover {
+  background: #eef2ff;
+  color: #3730a3;
 }
 
-.pagination-buttons .page-btn:disabled {
-  opacity: 0.35;
-  cursor: not-allowed;
-}
