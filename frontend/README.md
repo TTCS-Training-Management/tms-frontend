@@ -1,16 +1,23 @@
-# React + Vite
+# Website Quản Lý Bài Nộp & Lịch Sử Phiên Bản (SCRUM-91)
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+Ứng dụng Frontend React (Vite) phục vụ việc nộp bài, lưu trữ lịch sử các phiên bản nộp và chấm bài / mở lại bài theo yêu cầu đề tài.
 
-Currently, two official plugins are available:
+## Các chức năng chính
+1. **Học viên:**
+   - Nộp bài lần đầu (tạo Phiên bản 1) hoặc nộp lại (tự động tăng Phiên bản 2, 3...).
+   - Hiển thị danh sách lịch sử từng phiên bản độc lập (thời gian nộp, tên tệp, trạng thái, nút tải về tệp).
+   - Khóa chức năng nộp lại khi bài đã được Giảng viên chấm điểm.
+   - Nhận thông báo mở lại bài khi Giảng viên yêu cầu sửa đổi.
+2. **Giảng viên:**
+   - Xem lịch sử nộp bài của học viên.
+   - Thao tác "Đánh dấu đã chấm" (khóa quyền nộp lại của học viên).
+   - Thao tác "Mở lại bài đã chấm" để học viên tiếp tục nộp phiên bản tiếp theo.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
-
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and Oxlint's TypeScript related rules in your project.
+## Cách chạy dự án
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+Truy cập: `http://localhost:5173`
+API Backend kết nối: `http://127.0.0.1:8000`
