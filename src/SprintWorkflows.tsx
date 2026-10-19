@@ -248,6 +248,7 @@ export default function SprintWorkflows({ module, permission, user, request, not
   const [revisionModal, setRevisionModal] = useState<{ open: boolean; submissionId?: number; dueAt: string; feedback: string }>({
     open: false, dueAt: localDateTime(new Date(Date.now() + 3 * 86400000)), feedback: ''
   })
+  const [historyModalSubmission, setHistoryModalSubmission] = useState<Row | null>(null)
 
   // Materials & Announcements (Sprint 6)
   const [materials, setMaterials] = useState<Row[]>([])
@@ -949,35 +950,70 @@ export default function SprintWorkflows({ module, permission, user, request, not
             )}
 
             {/* Submit form */}
-            <form
-              onSubmit={(e) => {
-                e.preventDefault()
-                const data = new FormData()
-                Array.from(submissionFiles ?? []).forEach((file) => data.append('files', file))
-                const query = submissionRepo.trim() ? `?repo_url=${encodeURIComponent(submissionRepo.trim())}` : ''
-                void run(
-                  () => request(`/assignments/${selectedAssignment.id}/submissions${query}`, { method: 'POST', body: data }),
-                  'Đã nộp bài tập thành công!'
-                )
-              }}
-            >
-              <Grid>
-                <Input label="Liên kết Repository GitHub/GitLab (HTTPS)">
-                  <input
-                    type="url"
-                    placeholder="https://github.com/..."
-                    value={submissionRepo}
-                    onChange={(e) => setSubmissionRepo(e.target.value)}
-                  />
-                </Input>
-                <Input label="Tệp đính kèm (cho phép chọn nhiều, tối đa 20MB/tệp)">
-                  <input type="file" multiple onChange={(e) => setSubmissionFiles(e.target.files)} />
-                </Input>
-              </Grid>
-              <button className="wf-primary" disabled={busy}>
-                {selectedAssignment.submission ? 'Nộp lại bài (tạo phiên bản mới)' : 'Xác nhận nộp bài'}
-              </button>
-            </form>
+            {(() => {
+              const isGradedLocked = selectedAssignment.submission?.state === 'graded'
+              const isRevisionRequested = selectedAssignment.submission?.state === 'revision_requested' || selectedAssignment.submission?.state === 'needs_revision'
+
+              return (
+                <div>
+                  {isGradedLocked && (
+                    <div style={{ padding: '12px 16px', borderRadius: '8px', marginBottom: '14px', background: '#fffbeb', border: '1px solid #fde68a', color: '#92400e' }}>
+                      <strong>🔒 Bài nộp đã được chấm điểm:</strong> Chức năng nộp lại đang bị khóa để bảo đảm tính toàn vẹn. Bạn chỉ có thể nộp lại sau khi Giảng viên mở lại bài hoặc yêu cầu làm lại bài.
+                    </div>
+                  )}
+
+                  {isRevisionRequested && (
+                    <div style={{ padding: '12px 16px', borderRadius: '8px', marginBottom: '14px', background: '#eff6ff', border: '1px solid #bfdbfe', color: '#1e40af' }}>
+                      <strong>🔔 Giảng viên đã yêu cầu làm lại bài nộp:</strong> Bạn đã được mở quyền nộp lại phiên bản mới. Vui lòng cập nhật bài làm và nộp phiên bản tiếp theo trước hạn nộp bổ sung.
+                    </div>
+                  )}
+
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      if (isGradedLocked) {
+                        notify('Bài đã được chấm điểm và đang bị khóa. Bạn không thể nộp lại.', 'error')
+                        return
+                      }
+                      const data = new FormData()
+                      Array.from(submissionFiles ?? []).forEach((file) => data.append('files', file))
+                      const query = submissionRepo.trim() ? `?repo_url=${encodeURIComponent(submissionRepo.trim())}` : ''
+                      void run(
+                        () => request(`/assignments/${selectedAssignment.id}/submissions${query}`, { method: 'POST', body: data }),
+                        'Đã nộp bài tập thành công!'
+                      )
+                    }}
+                  >
+                    <Grid>
+                      <Input label="Liên kết Repository GitHub/GitLab (HTTPS)">
+                        <input
+                          type="url"
+                          placeholder="https://github.com/..."
+                          disabled={busy || isGradedLocked}
+                          value={submissionRepo}
+                          onChange={(e) => setSubmissionRepo(e.target.value)}
+                        />
+                      </Input>
+                      <Input label="Tệp đính kèm (cho phép chọn nhiều, tối đa 20MB/tệp)">
+                        <input
+                          type="file"
+                          multiple
+                          disabled={busy || isGradedLocked}
+                          onChange={(e) => setSubmissionFiles(e.target.files)}
+                        />
+                      </Input>
+                    </Grid>
+                    <button className="wf-primary" disabled={busy || isGradedLocked}>
+                      {isGradedLocked
+                        ? 'Đã chấm điểm (Khóa nộp lại)'
+                        : selectedAssignment.submission
+                        ? 'Nộp lại bài (tạo phiên bản mới)'
+                        : 'Xác nhận nộp bài'}
+                    </button>
+                  </form>
+                </div>
+              )
+            })()}
           </Panel>
         )}
 
@@ -1058,6 +1094,18 @@ export default function SprintWorkflows({ module, permission, user, request, not
                         ))}
                         {r.submission.versions[0].repo_url && (
                           <div><a href={r.submission.versions[0].repo_url} target="_blank" rel="noreferrer">🔗 Mở repo ↗</a></div>
+                        )}
+                        {r.submission.versions && r.submission.versions.length > 1 && (
+                          <div style={{ marginTop: '6px' }}>
+                            <button
+                              type="button"
+                              className="wf-button"
+                              style={{ fontSize: '11.5px', padding: '3px 8px', background: '#eef2ff', borderColor: '#c7d2fe', color: '#4338ca' }}
+                              onClick={() => setHistoryModalSubmission(r)}
+                            >
+                              📜 Lịch sử ({r.submission.versions.length} phiên bản)
+                            </button>
+                          </div>
                         )}
                       </div>
                     ) : (
@@ -1207,6 +1255,72 @@ export default function SprintWorkflows({ module, permission, user, request, not
                 >
                   Xác nhận yêu cầu
                 </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* SCRUM-91: Teacher View Version History Modal */}
+        {historyModalSubmission && (
+          <div className="wf-modal-overlay">
+            <div className="wf-modal" style={{ maxWidth: '780px' }}>
+              <div className="wf-modal-header">
+                <h3>Lịch sử nộp bài: {historyModalSubmission.student_name} ({historyModalSubmission.student_code})</h3>
+                <button className="wf-modal-close" onClick={() => setHistoryModalSubmission(null)}>×</button>
+              </div>
+              <p style={{ margin: '4px 0 16px', color: '#64748b', fontSize: '13px' }}>
+                Hệ thống lưu trữ độc lập từng phiên bản nộp. Giảng viên có thể xem và tải về tệp bài làm của từng phiên bản:
+              </p>
+              <DataTable
+                rows={historyModalSubmission.submission?.versions ?? []}
+                columns={[
+                  ['Phiên bản', (v: Row) => (
+                    <>
+                      <strong>#v{v.version_number}</strong>
+                      {v.version_number === historyModalSubmission.submission?.current_version && (
+                        <span className="wf-badge wf-badge-info" style={{ marginLeft: '6px' }}>Mới nhất</span>
+                      )}
+                      {v.is_late && <span className="wf-badge wf-badge-danger" style={{ marginLeft: '4px' }}>Muộn</span>}
+                    </>
+                  )],
+                  ['Thời điểm nộp', (v: Row) => displayDate(v.submitted_at)],
+                  ['Repo', (v: Row) => v.repo_url ? <a href={v.repo_url} target="_blank" rel="noreferrer">🔗 Repo ↗</a> : '—'],
+                  [
+                    'Tệp đính kèm',
+                    (v: Row) => (
+                      <div style={{ display: 'grid', gap: '4px' }}>
+                        {(v.files ?? []).map((f: Row) => (
+                          <a
+                            key={f.storage_name}
+                            className="wf-file-link"
+                            href={`${apiBase}/submissions/files/${encodeURIComponent(f.storage_name)}`}
+                            onClick={(e) => {
+                              const token = localStorage.getItem('tms_token')
+                              if (!token) return
+                              e.preventDefault()
+                              void fetch(e.currentTarget.href, { headers: { Authorization: `Bearer ${token}` } })
+                                .then((res) => res.blob())
+                                .then((blob) => {
+                                  const url = URL.createObjectURL(blob)
+                                  const a = document.createElement('a')
+                                  a.href = url
+                                  a.download = f.file_name
+                                  a.click()
+                                  URL.revokeObjectURL(url)
+                                })
+                                .catch(() => notify('Không thể tải tệp nộp.', 'error'))
+                            }}
+                          >
+                            📄 {f.file_name}
+                          </a>
+                        ))}
+                      </div>
+                    )
+                  ]
+                ]}
+              />
+              <div className="wf-actions" style={{ justifyContent: 'flex-end', marginTop: '16px' }}>
+                <button className="wf-button" onClick={() => setHistoryModalSubmission(null)}>Đóng</button>
               </div>
             </div>
           </div>
